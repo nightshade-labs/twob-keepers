@@ -1,5 +1,5 @@
 {
-  "address": "642aEWvs8FXKkThPEHR5hLQ2XPSAhiLWaE2Mn3adDhuZ",
+  "address": "DkjFmy1YNDDDaXoy3ZvuCnpb294UDbpbT457gUyiFS5V",
   "metadata": {
     "name": "twob_anchor",
     "version": "0.1.0",
@@ -1161,6 +1161,337 @@
       ]
     },
     {
+      "name": "close_exits_account",
+      "discriminator": [
+        241,
+        198,
+        24,
+        114,
+        18,
+        89,
+        131,
+        244
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "exits"
+          ]
+        },
+        {
+          "name": "exits",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  101,
+                  120,
+                  105,
+                  116,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "exits.index",
+                "account": "Exits"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.id",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bookkeeping",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  111,
+                  107,
+                  107,
+                  101,
+                  101,
+                  112,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "current_exits"
+        },
+        {
+          "name": "previous_exits"
+        },
+        {
+          "name": "current_prices",
+          "writable": true
+        },
+        {
+          "name": "previous_prices",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "reference_index",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "close_market",
+      "discriminator": [
+        88,
+        154,
+        248,
+        186,
+        48,
+        14,
+        123,
+        244
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "program_config"
+          ]
+        },
+        {
+          "name": "program_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.id",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "close_prices_account",
+      "discriminator": [
+        244,
+        43,
+        217,
+        128,
+        151,
+        50,
+        171,
+        17
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "prices"
+          ]
+        },
+        {
+          "name": "prices",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  105,
+                  99,
+                  101,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "prices.index",
+                "account": "Prices"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.id",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bookkeeping",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  111,
+                  107,
+                  107,
+                  101,
+                  101,
+                  112,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "current_exits"
+        },
+        {
+          "name": "previous_exits"
+        },
+        {
+          "name": "current_prices",
+          "writable": true
+        },
+        {
+          "name": "previous_prices",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "reference_index",
+          "type": "u64"
+        }
+      ]
+    },
+    {
       "name": "initialize_market",
       "discriminator": [
         35,
@@ -1463,6 +1794,131 @@
         }
       ],
       "args": []
+    },
+    {
+      "name": "pause_market",
+      "discriminator": [
+        216,
+        238,
+        4,
+        164,
+        65,
+        11,
+        162,
+        91
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "program_config"
+          ]
+        },
+        {
+          "name": "program_config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  114,
+                  111,
+                  103,
+                  114,
+                  97,
+                  109,
+                  95,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.id",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bookkeeping",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  111,
+                  111,
+                  107,
+                  107,
+                  101,
+                  101,
+                  112,
+                  105,
+                  110,
+                  103
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "current_exits"
+        },
+        {
+          "name": "previous_exits"
+        },
+        {
+          "name": "current_prices",
+          "writable": true
+        },
+        {
+          "name": "previous_prices",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "reference_index",
+          "type": "u64"
+        }
+      ]
     },
     {
       "name": "provide_liquidity",
@@ -2271,10 +2727,12 @@
           "name": "quote_mint"
         },
         {
-          "name": "authority_base_token_account"
+          "name": "authority_base_token_account",
+          "writable": true
         },
         {
-          "name": "authority_quote_token_account"
+          "name": "authority_quote_token_account",
+          "writable": true
         },
         {
           "name": "market",
@@ -2987,7 +3445,7 @@
           "type": "u64"
         },
         {
-          "name": "duration",
+          "name": "end_slot",
           "type": "u64"
         }
       ]
