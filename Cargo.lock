@@ -5238,6 +5238,7 @@ dependencies = [
  "anchor-lang",
  "anchor-spl",
  "anyhow",
+ "solana-rpc-client-types",
  "tokio",
 ]
 
