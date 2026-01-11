@@ -55,22 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
         for (position_address, position_account) in position_accounts.iter() {
             if current_slot > position_account.end_slot {
-                let payer = payer.clone();
-
-                let end_index = position_account.end_slot / 1000;
-
-                let future_exits_pda = resolver.exits_pda(&market_pda.address(), end_index);
-                let current_exits_pda = resolver.exits_pda(&market_pda.address(), reference_index);
-                let previous_exits_pda =
-                    resolver.exits_pda(&market_pda.address(), reference_index - 1);
-
-                let future_prices_pda = resolver.prices_pda(&market_pda.address(), end_index);
-                let current_prices_pda =
-                    resolver.prices_pda(&market_pda.address(), reference_index);
-                let previous_prices_pda =
-                    resolver.prices_pda(&market_pda.address(), reference_index - 1);
-
-                // // // We know that base is wrapped sol, that's why we generate keypair
+                // // // We know that base is wrapped sol, that's why we use pda
                 // let authority_base_token_account = resolver.associated_token_account(
                 //     &position_account.authority,
                 //     &market_account.base_mint,
@@ -82,43 +67,69 @@ async fn main() -> anyhow::Result<()> {
                     &market_account.quote_mint,
                 );
 
-                let public_close_position_ix = program
-                    .request()
-                    .accounts(accounts::PublicClosePosition {
-                        signer: payer.pubkey(),
-                        position_authority: position_account.authority,
-                        base_mint: base_mint,
-                        quote_mint: quote_mint,
-                        authority_base_token_account: tmp_pubkey,
-                        authority_quote_token_account: authority_quote_token_account,
-                        market: market_pda.address(),
-                        trade_position: *position_address,
-                        base_vault: base_vault_address,
-                        quote_vault: quote_vault_address,
-                        bookkeeping: bookkeeping_pda.address(),
-                        future_exits: future_exits_pda.address(),
-                        future_prices: future_prices_pda.address(),
-                        current_exits: current_exits_pda.address(),
-                        previous_exits: previous_exits_pda.address(),
-                        current_prices: current_prices_pda.address(),
-                        previous_prices: previous_prices_pda.address(),
-                        base_token_program: spl_token::ID,
-                        quote_token_program: spl_token::ID,
-                        associated_token_program: spl_associated_token_account::ID,
-                        system_program: system_program::ID,
-                    })
-                    .args(args::PublicClosePosition {
-                        reference_index: reference_index,
-                    })
-                    .instructions()?
-                    .remove(0);
+                // Only close if quote token account exits, otherwise we have to pay rent to initialize it or tx will fail
+                if let Ok(_ata) = program
+                    .account::<anchor_spl::token_interface::TokenAccount>(
+                        authority_quote_token_account,
+                    )
+                    .await
+                {
+                    let payer = payer.clone();
 
-                program
-                    .request()
-                    .instruction(public_close_position_ix)
-                    .signer(payer)
-                    .send()
-                    .await?;
+                    let end_index = position_account.end_slot / 1000;
+
+                    let future_exits_pda = resolver.exits_pda(&market_pda.address(), end_index);
+                    let current_exits_pda =
+                        resolver.exits_pda(&market_pda.address(), reference_index);
+                    let previous_exits_pda =
+                        resolver.exits_pda(&market_pda.address(), reference_index - 1);
+
+                    let future_prices_pda = resolver.prices_pda(&market_pda.address(), end_index);
+                    let current_prices_pda =
+                        resolver.prices_pda(&market_pda.address(), reference_index);
+                    let previous_prices_pda =
+                        resolver.prices_pda(&market_pda.address(), reference_index - 1);
+
+                    let public_close_position_ix = program
+                        .request()
+                        .accounts(accounts::PublicClosePosition {
+                            signer: payer.pubkey(),
+                            position_authority: position_account.authority,
+                            base_mint: base_mint,
+                            quote_mint: quote_mint,
+                            authority_base_token_account: tmp_pubkey,
+                            authority_quote_token_account: authority_quote_token_account,
+                            market: market_pda.address(),
+                            trade_position: *position_address,
+                            base_vault: base_vault_address,
+                            quote_vault: quote_vault_address,
+                            bookkeeping: bookkeeping_pda.address(),
+                            future_exits: future_exits_pda.address(),
+                            future_prices: future_prices_pda.address(),
+                            current_exits: current_exits_pda.address(),
+                            previous_exits: previous_exits_pda.address(),
+                            current_prices: current_prices_pda.address(),
+                            previous_prices: previous_prices_pda.address(),
+                            base_token_program: spl_token::ID,
+                            quote_token_program: spl_token::ID,
+                            associated_token_program: spl_associated_token_account::ID,
+                            system_program: system_program::ID,
+                        })
+                        .args(args::PublicClosePosition {
+                            reference_index: reference_index,
+                        })
+                        .instructions()?
+                        .remove(0);
+
+                    let sig = program
+                        .request()
+                        .instruction(public_close_position_ix)
+                        .signer(payer)
+                        .send()
+                        .await?;
+
+                    println!("Closed finished trade position. Sig: {}", sig);
+                }
             } else {
                 if position_account.end_slot < next_end_slot {
                     next_end_slot = position_account.end_slot;
@@ -126,7 +137,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        println!("No open trade positions right now :(");
-        sleep(Duration::from_millis(400 * 1000)).await;
+        println!("No finished trade positions right now");
+        println!("Next position ends at slot {}", next_end_slot);
+
+        let sleep_duration_ms = if next_end_slot > current_slot + 2000 {
+            2000 * 400
+        } else {
+            (next_end_slot - current_slot + 1) * 400
+        };
+        println!(
+            "Sleeping for {} seconds",
+            Duration::from_millis(sleep_duration_ms).as_secs_f64()
+        );
+
+        sleep(Duration::from_millis(sleep_duration_ms)).await;
     }
 }
