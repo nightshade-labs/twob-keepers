@@ -4388,6 +4388,34 @@
       ]
     }
   ],
+  "events": [
+    {
+      "name": "ClosePositionEvent",
+      "discriminator": [
+        198,
+        217,
+        115,
+        95,
+        191,
+        120,
+        142,
+        137
+      ]
+    },
+    {
+      "name": "MarketUpdateEvent",
+      "discriminator": [
+        114,
+        70,
+        57,
+        176,
+        187,
+        142,
+        113,
+        145
+      ]
+    }
+  ],
   "errors": [
     {
       "code": 6000,
@@ -4518,6 +4546,42 @@
           },
           {
             "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClosePositionEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_id",
+            "type": "u64"
+          },
+          {
+            "name": "deposit_amount",
+            "type": "u64"
+          },
+          {
+            "name": "swapped_amount",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_amount",
+            "type": "u64"
+          },
+          {
+            "name": "fee_amount",
+            "type": "u64"
+          },
+          {
+            "name": "is_buy",
             "type": "u8"
           }
         ]
@@ -4747,6 +4811,26 @@
       }
     },
     {
+      "name": "MarketUpdateEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market_id",
+            "type": "u64"
+          },
+          {
+            "name": "base_flow",
+            "type": "u64"
+          },
+          {
+            "name": "quote_flow",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "Prices",
       "type": {
         "kind": "struct",
@@ -4872,13 +4956,6 @@
             "name": "slots_without_trades_snapshot",
             "docs": [
               "Snapshot of slots without trades in this market when this order was created"
-            ],
-            "type": "u64"
-          },
-          {
-            "name": "inactive_slots",
-            "docs": [
-              "Number of slots this position is inactive (slots without trading)"
             ],
             "type": "u64"
           },
