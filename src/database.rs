@@ -24,7 +24,8 @@ impl Database {
             .context("Failed to create connection pool")?;
 
         // Test the connection
-        let _ = pool.get()
+        let _ = pool
+            .get()
             .await
             .context("Failed to get connection from pool")?;
 
@@ -66,7 +67,10 @@ impl Database {
                     eprintln!("  Detail: {:?}", db_err.detail());
                     eprintln!("  Hint: {:?}", db_err.hint());
                 }
-                Err(anyhow::anyhow!("Failed to insert market update event: {}", e))
+                Err(anyhow::anyhow!(
+                    "Failed to insert market update event: {}",
+                    e
+                ))
             }
         }
     }
@@ -115,7 +119,10 @@ impl Database {
                     eprintln!("  Detail: {:?}", db_err.detail());
                     eprintln!("  Hint: {:?}", db_err.hint());
                 }
-                Err(anyhow::anyhow!("Failed to insert close position event: {}", e))
+                Err(anyhow::anyhow!(
+                    "Failed to insert close position event: {}",
+                    e
+                ))
             }
         }
     }
