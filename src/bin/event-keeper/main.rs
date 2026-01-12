@@ -5,12 +5,31 @@ use anchor_client::{
 use anchor_lang::prelude::*;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use twob_keepers::Database;
 
 declare_program!(twob_anchor);
 use twob_anchor::events::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
+    // Load database credentials
+    // let supabase_url = std::env::var("SUPABASE_URL").expect("SUPABASE_URL must be set");
+    let database_password =
+        std::env::var("DATABASE_PASSWORD").expect("DATABASE_PASSWORD must be set");
+
+    // Construct PostgreSQL connection string
+    // Using direct connection (port 5432) instead of pooler (port 6543) to support prepared statements
+    let database_url = format!(
+        "postgresql://postgres:{}@db.xzlbpjbsuyrjoijmmtom.supabase.co:5432/postgres",
+        database_password
+    );
+
+    // Connect to database
+    let db = Arc::new(Database::connect(&database_url).await?);
+    println!("Connected to database");
+
     // let payer = read_keypair_file("/Users/thgehr/.config/solana/id.json")
     //     .expect("Keypair file is required");
     let payer = Keypair::new();
@@ -49,19 +68,53 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
+    let db_clone = db.clone();
     let market_update_task = tokio::spawn(async move {
         while let Some((sig, slot, event)) = market_update_event_receiver.recv().await {
-            println!("Signature {}", sig);
-            println!("Slot: {}", slot);
-            println!("Event {:?}", event);
+            println!(
+                "MarketUpdateEvent - Signature: {}, Slot: {}, Market: {}",
+                sig, slot, event.market_id
+            );
+
+            if let Err(e) = db_clone
+                .insert_market_update_event(
+                    &sig.to_string(),
+                    slot,
+                    event.market_id,
+                    event.base_flow,
+                    event.quote_flow,
+                )
+                .await
+            {
+                eprintln!("Failed to insert market update event: {}", e);
+            }
         }
     });
 
+    let db_clone = db.clone();
     let close_position_task = tokio::spawn(async move {
         while let Some((sig, slot, event)) = close_position_event_receiver.recv().await {
-            println!("Signature {}", sig);
-            println!("Slot: {}", slot);
-            println!("Event {:?}", event);
+            println!(
+                "ClosePositionEvent - Signature: {}, Slot: {}, Market: {}",
+                sig, slot, event.market_id
+            );
+
+            if let Err(e) = db_clone
+                .insert_close_position_event(
+                    &sig.to_string(),
+                    slot,
+                    &event.position_authority.to_string(),
+                    event.market_id,
+                    event.deposit_amount,
+                    event.swapped_amount,
+                    event.remaining_amount,
+                    event.fee_amount,
+                    event.is_buy,
+                )
+                .await
+            {
+                eprintln!("Failed to insert close position event: {}", e);
+            }
         }
     });
 
