@@ -1,8 +1,6 @@
 use anchor_client::{
     Client, Cluster,
-    solana_sdk::{
-        commitment_config::CommitmentConfig, signature::read_keypair_file, signer::Signer,
-    },
+    solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair, signer::Signer},
 };
 use anchor_lang::prelude::*;
 use std::env;
@@ -20,8 +18,11 @@ use crate::twob_anchor::accounts::Market;
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let payer = read_keypair_file("/Users/thgehr/.config/solana/id.json")
-        .expect("Keypair file is required");
+    let payer_bytes: Vec<u8> =
+        serde_json::from_str(&env::var("PAYER_KEYPAIR").expect("PAYER_KEYPAIR must be set"))
+            .expect("PAYER_KEYPAIR must be a valid JSON array of bytes");
+    let payer =
+        Keypair::try_from(payer_bytes.as_slice()).expect("PAYER_KEYPAIR must be a valid keypair");
 
     let rpc_url = env::var("CLUSTER_RPC_URL").expect("CLUSTER_RPC_URL must be set");
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
