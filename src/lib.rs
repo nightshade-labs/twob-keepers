@@ -11,9 +11,11 @@ pub use accounts::{AccountResolver, PdaResult};
 pub use database::Database;
 
 /// The TwoB Anchor program ID
-pub const TWOB_PROGRAM_ID: &str = "DkjFmy1YNDDDaXoy3ZvuCnpb294UDbpbT457gUyiFS5V";
+pub const TWOB_PROGRAM_ID: &str = "twobmF9NrRYUA6AN1yTdnWYfEpCr9UXWpESTRPG1KJj";
 
 /// Parse the program ID from the constant string
 pub fn program_id() -> anchor_lang::prelude::Pubkey {
     TWOB_PROGRAM_ID.parse().expect("Invalid program ID")
 }
+
+pub const ARRAY_LENGTH: u64 = 20;

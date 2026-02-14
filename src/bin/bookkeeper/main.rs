@@ -5,26 +5,37 @@ use anchor_client::{
     },
 };
 use anchor_lang::prelude::*;
+use std::env;
 use std::sync::Arc;
-use twob_keepers::AccountResolver;
+use twob_keepers::{ARRAY_LENGTH, AccountResolver};
 
 use tokio::time::{Duration, sleep};
 
 declare_program!(twob_anchor);
 use twob_anchor::{accounts::Bookkeeping, client::accounts, client::args};
 
+use crate::twob_anchor::accounts::Market;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     let payer = read_keypair_file("/Users/thgehr/.config/solana/id.json")
         .expect("Keypair file is required");
-    let url = Cluster::Custom(
-        "http://127.0.0.1:8899".to_string(),
-        "ws://127.0.0.1:8900".to_string(),
-    );
 
-    let market_id = 1u64;
+    let rpc_url = env::var("CLUSTER_RPC_URL").expect("CLUSTER_RPC_URL must be set");
+    let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
+    let url = Cluster::Custom(rpc_url, ws_url);
+
+    let market_id: u64 = env::var("MARKET_ID")
+        .expect("MARKET_ID must be set")
+        .parse()
+        .expect("MARKET_ID must be a valid u64");
     let estimated_slot_duration_ms = 401; // +1 to sleep a bit longer
-    let slots_between_updates = 500;
+    let slots_between_updates: u64 = env::var("SLOTS_BETWEEN_UPDATES")
+        .expect("SLOTS_BETWEEN_UPDATES must be set")
+        .parse()
+        .expect("SLOTS_BETWEEN_UPDATES must be a valid u64");
 
     let payer = Arc::new(payer);
     let client = Client::new_with_options(url, payer.clone(), CommitmentConfig::confirmed());
@@ -34,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
 
     let market_pda = resolver.market_pda(market_id);
     let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
+
+    let market_account = program.account::<Market>(market_pda.address()).await?;
+    let end_slot_interval = market_account.end_slot_interval;
 
     loop {
         let payer = payer.clone();
@@ -46,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         if current_slot >= last_update_slot + slots_between_updates {
             println!("Updating book");
             let reference_slot = last_update_slot + slots_between_updates;
-            let reference_index = reference_slot / 1000; // 1000 = Arraylength (10) * market end slot interval (100)
+            let reference_index = reference_slot / end_slot_interval / ARRAY_LENGTH;
 
             let reference_exits_pda = resolver.exits_pda(&market_pda.address(), reference_index);
             let previous_exits_pda = resolver.exits_pda(&market_pda.address(), reference_index - 1);
