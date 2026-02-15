@@ -3,7 +3,7 @@ use anchor_client::{
     solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair},
 };
 use anchor_lang::prelude::*;
-use std::sync::Arc;
+use std::{env, sync::Arc};
 use tokio::sync::mpsc;
 use twob_keepers::Database;
 
@@ -33,10 +33,9 @@ async fn main() -> anyhow::Result<()> {
     // let payer = read_keypair_file("/Users/thgehr/.config/solana/id.json")
     //     .expect("Keypair file is required");
     let payer = Keypair::new();
-    let url = Cluster::Custom(
-        "http://127.0.0.1:8899".to_string(),
-        "ws://127.0.0.1:8900".to_string(),
-    );
+    let rpc_url = env::var("CLUSTER_RPC_URL").expect("CLUSTER_RPC_URL must be set");
+    let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
+    let url = Cluster::Custom(rpc_url, ws_url);
 
     let payer = Arc::new(payer);
     let client = Client::new_with_options(url, payer.clone(), CommitmentConfig::confirmed());
