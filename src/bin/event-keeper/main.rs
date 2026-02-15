@@ -40,10 +40,11 @@ async fn main() -> anyhow::Result<()> {
     let payer = Arc::new(payer);
     let client = Client::new_with_options(url, payer.clone(), CommitmentConfig::confirmed());
 
-    let program = client.program(twob_anchor::ID)?;
+    let market_event_program = client.program(twob_anchor::ID)?;
+    let close_event_program = client.program(twob_anchor::ID)?;
 
     let (market_update_event_sender, mut market_update_event_receiver) = mpsc::unbounded_channel();
-    let market_update_event_unsubscriber = program
+    let market_update_event_unsubscriber = market_event_program
         .on(move |event_ctx, event: MarketUpdateEvent| {
             if market_update_event_sender
                 .send((event_ctx.signature, event_ctx.slot, event))
@@ -56,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (close_position_event_sender, mut close_position_event_receiver) =
         mpsc::unbounded_channel();
-    let close_position_event_unsubscriber = program
+    let close_position_event_unsubscriber = close_event_program
         .on(move |event_ctx, event: ClosePositionEvent| {
             if close_position_event_sender
                 .send((event_ctx.signature, event_ctx.slot, event))
