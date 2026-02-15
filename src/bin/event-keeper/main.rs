@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     // Construct PostgreSQL connection string
     // Using direct connection (port 5432) instead of pooler (port 6543) to support prepared statements
     let database_url = format!(
-        "postgresql://postgres:{}@db.xzlbpjbsuyrjoijmmtom.supabase.co:5432/postgres",
+        "postgresql://postgres.xzlbpjbsuyrjoijmmtom:{}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
         database_password
     );
 
