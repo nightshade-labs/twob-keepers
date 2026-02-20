@@ -7,8 +7,8 @@ use anchor_client::{
 use anchor_lang::prelude::*;
 use anchor_spl::{associated_token::spl_associated_token_account, token::spl_token};
 
-use std::{sync::Arc, u64};
-use twob_keepers::AccountResolver;
+use std::{env, sync::Arc, u64};
+use twob_keepers::{ARRAY_LENGTH, AccountResolver};
 
 use tokio::time::{Duration, sleep};
 
@@ -19,12 +19,13 @@ use crate::twob_anchor::accounts::{Market, TradePosition};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     let payer = read_keypair_file("/Users/thgehr/.config/solana/id.json")
         .expect("Keypair file is required");
-    let url = Cluster::Custom(
-        "http://127.0.0.1:8899".to_string(),
-        "ws://127.0.0.1:8900".to_string(),
-    );
+    let rpc_url = env::var("CLUSTER_RPC_URL").expect("CLUSTER_RPC_URL must be set");
+    let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
+    let url = Cluster::Custom(rpc_url, ws_url);
 
     let market_id = 1u64;
 
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let mut next_end_slot = u64::MAX;
         let current_slot = program.rpc().get_slot().await?;
-        let reference_index = current_slot / 1000;
+        let reference_index = current_slot / ARRAY_LENGTH / market_account.end_slot_interval;
 
         // TODO: Need to filter position accounts for correct market, currently there will be only one market, maybe add market id to position account
         let position_accounts = program.accounts::<TradePosition>(vec![]).await?;
@@ -76,7 +77,8 @@ async fn main() -> anyhow::Result<()> {
                 {
                     let payer = payer.clone();
 
-                    let end_index = position_account.end_slot / 1000;
+                    let end_index =
+                        position_account.end_slot / ARRAY_LENGTH / market_account.end_slot_interval;
 
                     let future_exits_pda = resolver.exits_pda(&market_pda.address(), end_index);
                     let current_exits_pda =
