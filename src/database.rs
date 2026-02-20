@@ -81,6 +81,8 @@ impl Database {
         slot: u64,
         position_authority: &str,
         market_id: u64,
+        start_slot: u64,
+        end_slot: u64,
         deposit_amount: u64,
         swapped_amount: u64,
         remaining_amount: u64,
@@ -92,14 +94,16 @@ impl Database {
         let result = client
             .execute(
                 "INSERT INTO close_position_events
-                 (signature, slot, position_authority, market_id, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 (signature, slot, position_authority, market_id, start_slot, end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (signature) DO NOTHING",
                 &[
                     &signature,
                     &(slot as i64),
                     &position_authority,
                     &(market_id as i64),
+                    &(start_slot as i64),
+                    &(end_slot as i64),
                     &(deposit_amount as i64),
                     &(swapped_amount as i64),
                     &(remaining_amount as i64),

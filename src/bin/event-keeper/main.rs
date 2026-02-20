@@ -240,6 +240,8 @@ async fn handle_logs_notification(
                         slot,
                         &event.position_authority.to_string(),
                         event.market_id,
+                        event.start_slot,
+                        event.end_slot,
                         event.deposit_amount,
                         event.swapped_amount,
                         event.remaining_amount,
