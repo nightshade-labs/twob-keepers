@@ -4,11 +4,17 @@
 //! This library provides utilities for the bookkeeper, liquidity-keeper, and trade-keeper binaries.
 
 pub mod accounts;
+pub mod clickhouse_sink;
 pub mod database;
+pub mod sink;
 
 // Re-export commonly used types
 pub use accounts::{AccountResolver, PdaResult};
+pub use clickhouse_sink::{ClickHouseSink, ClickHouseSinkConfig};
 pub use database::Database;
+pub use sink::{
+    ClosePositionEventRecord, EventSink, FanoutSink, MarketUpdateEventRecord, SinkMetricsSnapshot,
+};
 
 /// The TwoB Anchor program ID
 pub const TWOB_PROGRAM_ID: &str = "twobmF9NrRYUA6AN1yTdnWYfEpCr9UXWpESTRPG1KJj";

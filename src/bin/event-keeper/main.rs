@@ -1,6 +1,6 @@
 use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
 use anchor_lang::{AnchorDeserialize, Discriminator, prelude::*};
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
@@ -15,7 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::MissedTickBehavior;
-use twob_keepers::Database;
+use twob_keepers::{
+    ClickHouseSink, ClickHouseSinkConfig, ClosePositionEventRecord, Database, EventSink,
+    FanoutSink, MarketUpdateEventRecord, SinkMetricsSnapshot,
+};
 
 declare_program!(twob_anchor);
 use twob_anchor::events::*;
@@ -27,6 +30,12 @@ const PROGRAM_DATA_PREFIX: &str = "Program data: ";
 enum KeeperEvent {
     MarketUpdate(MarketUpdateEvent),
     ClosePosition(ClosePositionEvent),
+}
+
+#[derive(Debug)]
+struct IndexedKeeperEvent {
+    event_index: u16,
+    event: KeeperEvent,
 }
 
 struct IngestStats {
@@ -90,7 +99,7 @@ impl IngestStats {
         }
     }
 
-    fn log_health(&self) {
+    fn log_health(&self, sink: &dyn EventSink) {
         let uptime_seconds = self.started_at.elapsed().as_secs();
         let last_market = format_last_seen(self.last_market_at);
         let last_close = format_last_seen(self.last_close_at);
@@ -106,6 +115,10 @@ impl IngestStats {
             self.db_errors,
             self.unknown_discriminators.len(),
         );
+
+        for snapshot in sink.metrics_snapshot() {
+            println!("{}", format_sink_metrics(snapshot));
+        }
     }
 }
 
@@ -113,16 +126,52 @@ impl IngestStats {
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let database_password =
-        std::env::var("DATABASE_PASSWORD").expect("DATABASE_PASSWORD must be set");
+    let mut sinks: Vec<Arc<dyn EventSink>> = Vec::new();
 
-    let database_url = format!(
-        "postgresql://postgres.xzlbpjbsuyrjoijmmtom:{}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
-        database_password
-    );
+    let database_url = env::var("DATABASE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::var("DATABASE_PASSWORD").ok().map(|database_password| {
+                format!(
+                    "postgresql://postgres.xzlbpjbsuyrjoijmmtom:{}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
+                    database_password
+                )
+            })
+        });
 
-    let db = Arc::new(Database::connect(&database_url).await?);
-    println!("Connected to database");
+    if let Some(database_url) = database_url {
+        let postgres_sink: Arc<dyn EventSink> = Arc::new(Database::connect(&database_url).await?);
+        sinks.push(postgres_sink);
+        println!("Connected to Postgres sink");
+    } else {
+        println!("Postgres sink is disabled (set DATABASE_URL to enable)");
+    }
+
+    if let Some(clickhouse_config) = ClickHouseSinkConfig::from_env_optional()? {
+        let clickhouse_sink: Arc<dyn EventSink> =
+            Arc::new(ClickHouseSink::connect(clickhouse_config).await?);
+        sinks.push(clickhouse_sink);
+        println!("Connected to ClickHouse sink");
+    } else {
+        println!("CLICKHOUSE_URL is not set; ClickHouse sink is disabled");
+    }
+
+    if sinks.is_empty() {
+        return Err(anyhow!(
+            "No sinks configured. Set CLICKHOUSE_URL and/or DATABASE_URL"
+        ));
+    }
+
+    let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
+        sinks
+            .into_iter()
+            .next()
+            .expect("sinks contains one configured sink")
+    } else {
+        Arc::new(FanoutSink::new(sinks))
+    };
 
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
     let program_id = twob_anchor::ID.to_string();
@@ -135,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
             program_id, ws_url
         );
 
-        match run_subscription(&ws_url, &program_id, db.clone()).await {
+        match run_subscription(&ws_url, &program_id, sink.clone()).await {
             Ok(()) => eprintln!("Log subscription ended, reconnecting"),
             Err(error) => eprintln!("Log subscription failed: {error:#}"),
         }
@@ -145,7 +194,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_subscription(ws_url: &str, program_id: &str, db: Arc<Database>) -> anyhow::Result<()> {
+async fn run_subscription(
+    ws_url: &str,
+    program_id: &str,
+    sink: Arc<dyn EventSink>,
+) -> anyhow::Result<()> {
     let pubsub_client = PubsubClient::new(ws_url)
         .await
         .context("Failed to create pubsub websocket client")?;
@@ -175,12 +228,12 @@ async fn run_subscription(ws_url: &str, program_id: &str, db: Arc<Database>) -> 
                     break;
                 };
 
-                if let Err(error) = handle_logs_notification(db.as_ref(), program_id, notification, &mut stats).await {
+                if let Err(error) = handle_logs_notification(sink.as_ref(), program_id, notification, &mut stats).await {
                     eprintln!("Failed to handle log notification: {error:#}");
                 }
             }
             _ = heartbeat.tick() => {
-                stats.log_health();
+                stats.log_health(sink.as_ref());
             }
         }
     }
@@ -190,7 +243,7 @@ async fn run_subscription(ws_url: &str, program_id: &str, db: Arc<Database>) -> 
 }
 
 async fn handle_logs_notification(
-    db: &Database,
+    sink: &dyn EventSink,
     program_id: &str,
     notification: RpcResponse<RpcLogsResponse>,
     stats: &mut IngestStats,
@@ -198,14 +251,14 @@ async fn handle_logs_notification(
     let slot = notification.context.slot;
     let signature = notification.value.signature;
 
-    for event in parse_events_from_logs(
+    for indexed_event in parse_events_from_logs(
         program_id,
         &notification.value.logs,
         &signature,
         slot,
         stats,
     ) {
-        match event {
+        match indexed_event.event {
             KeeperEvent::MarketUpdate(event) => {
                 println!(
                     "MarketUpdateEvent - Signature: {}, Slot: {}, Market: {}",
@@ -213,18 +266,18 @@ async fn handle_logs_notification(
                 );
                 stats.record_market_event();
 
-                if let Err(error) = db
-                    .insert_market_update_event(
-                        &signature,
-                        slot,
-                        event.market_id,
-                        event.base_flow,
-                        event.quote_flow,
-                    )
-                    .await
-                {
+                let record = MarketUpdateEventRecord {
+                    signature: signature.clone(),
+                    event_index: indexed_event.event_index,
+                    slot,
+                    market_id: event.market_id,
+                    base_flow: event.base_flow,
+                    quote_flow: event.quote_flow,
+                };
+
+                if let Err(error) = sink.insert_market_update_event(record).await {
                     stats.record_db_error();
-                    eprintln!("Failed to insert market update event: {error}");
+                    eprintln!("Failed to insert market update event via sink: {error}");
                 }
             }
             KeeperEvent::ClosePosition(event) => {
@@ -234,24 +287,24 @@ async fn handle_logs_notification(
                 );
                 stats.record_close_event();
 
-                if let Err(error) = db
-                    .insert_close_position_event(
-                        &signature,
-                        slot,
-                        &event.position_authority.to_string(),
-                        event.market_id,
-                        event.start_slot,
-                        event.end_slot,
-                        event.deposit_amount,
-                        event.swapped_amount,
-                        event.remaining_amount,
-                        event.fee_amount,
-                        event.is_buy,
-                    )
-                    .await
-                {
+                let record = ClosePositionEventRecord {
+                    signature: signature.clone(),
+                    event_index: indexed_event.event_index,
+                    slot,
+                    position_authority: event.position_authority.to_string(),
+                    market_id: event.market_id,
+                    start_slot: event.start_slot,
+                    end_slot: event.end_slot,
+                    deposit_amount: event.deposit_amount,
+                    swapped_amount: event.swapped_amount,
+                    remaining_amount: event.remaining_amount,
+                    fee_amount: event.fee_amount,
+                    is_buy: event.is_buy,
+                };
+
+                if let Err(error) = sink.insert_close_position_event(record).await {
                     stats.record_db_error();
-                    eprintln!("Failed to insert close position event: {error}");
+                    eprintln!("Failed to insert close position event via sink: {error}");
                 }
             }
         }
@@ -266,7 +319,7 @@ fn parse_events_from_logs(
     signature: &str,
     slot: u64,
     stats: &mut IngestStats,
-) -> Vec<KeeperEvent> {
+) -> Vec<IndexedKeeperEvent> {
     let mut call_stack: Vec<&str> = Vec::new();
     let mut events = Vec::new();
 
@@ -302,7 +355,19 @@ fn parse_events_from_logs(
         };
 
         match decode_event(&log_bytes) {
-            Ok(Some(event)) => events.push(event),
+            Ok(Some(event)) => {
+                if events.len() >= u16::MAX as usize {
+                    stats.record_decode_error(
+                        signature,
+                        slot,
+                        "Event index overflow while parsing logs",
+                    );
+                    continue;
+                }
+
+                let event_index = events.len() as u16;
+                events.push(IndexedKeeperEvent { event_index, event });
+            }
             Ok(None) => stats.record_unknown_discriminator(&log_bytes),
             Err(error) => stats.record_decode_error(signature, slot, &error),
         }
@@ -361,4 +426,29 @@ fn hex_discriminator(discriminator: [u8; 8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+fn format_sink_metrics(snapshot: SinkMetricsSnapshot) -> String {
+    format!(
+        "SinkHealth - sink={} market_ok={} market_err={} close_ok={} close_err={} queued={} buffered_market={} buffered_close={} flushed_market={} flushed_close={} flush_err={} last_flush_ms={} last_error={}",
+        snapshot.sink_name,
+        snapshot.market_update_successes,
+        snapshot.market_update_failures,
+        snapshot.close_position_successes,
+        snapshot.close_position_failures,
+        optional_u64_as_string(snapshot.queued_events),
+        optional_u64_as_string(snapshot.buffered_market_updates),
+        optional_u64_as_string(snapshot.buffered_close_positions),
+        optional_u64_as_string(snapshot.flushed_market_updates),
+        optional_u64_as_string(snapshot.flushed_close_positions),
+        optional_u64_as_string(snapshot.flush_failures),
+        optional_u64_as_string(snapshot.last_flush_latency_ms),
+        snapshot.last_error.unwrap_or_else(|| "none".to_string()),
+    )
+}
+
+fn optional_u64_as_string(value: Option<u64>) -> String {
+    value
+        .map(|inner| inner.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
