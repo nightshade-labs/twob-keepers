@@ -151,6 +151,23 @@ impl ClickHouseSink {
             .await
             .context("Failed to connect to ClickHouse")?;
 
+        ensure_table_exists(&client, &config.database, &config.market_updates_table)
+            .await
+            .with_context(|| {
+                format!(
+                    "Missing ClickHouse table for market updates: {}",
+                    qualify_table_name(&config.database, &config.market_updates_table)
+                )
+            })?;
+        ensure_table_exists(&client, &config.database, &config.close_positions_table)
+            .await
+            .with_context(|| {
+                format!(
+                    "Missing ClickHouse table for close positions: {}",
+                    qualify_table_name(&config.database, &config.close_positions_table)
+                )
+            })?;
+
         let metrics = Arc::new(ClickHouseMetrics::default());
         let (sender, receiver) = mpsc::channel(config.channel_capacity);
         tokio::spawn(run_worker(client, config, receiver, metrics.clone()));
@@ -375,19 +392,27 @@ async fn flush_batches(
         let market_updates_count = market_updates_batch.len() as u64;
         let started_at = Instant::now();
         if let Err(error) =
-            flush_market_updates(client, &config.market_updates_table, market_updates_batch).await
+            flush_market_updates(
+                client,
+                &config.database,
+                &config.market_updates_table,
+                market_updates_batch,
+            )
+            .await
         {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             {
                 let mut guard = metrics.last_error.lock().expect("mutex poisoned");
                 *guard = Some(format!(
-                    "flush market-update batch failure for table {}: {error}",
-                    config.market_updates_table
+                    "flush market-update batch failure for table {}: {:#}",
+                    qualify_table_name(&config.database, &config.market_updates_table),
+                    error
                 ));
             }
             eprintln!(
-                "Failed to flush {} market-update event(s) to ClickHouse: {error}",
-                market_updates_batch.len()
+                "Failed to flush {} market-update event(s) to ClickHouse: {:#}",
+                market_updates_batch.len(),
+                error
             );
         } else {
             metrics
@@ -406,20 +431,27 @@ async fn flush_batches(
         let close_positions_count = close_positions_batch.len() as u64;
         let started_at = Instant::now();
         if let Err(error) =
-            flush_close_positions(client, &config.close_positions_table, close_positions_batch)
-                .await
+            flush_close_positions(
+                client,
+                &config.database,
+                &config.close_positions_table,
+                close_positions_batch,
+            )
+            .await
         {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             {
                 let mut guard = metrics.last_error.lock().expect("mutex poisoned");
                 *guard = Some(format!(
-                    "flush close-position batch failure for table {}: {error}",
-                    config.close_positions_table
+                    "flush close-position batch failure for table {}: {:#}",
+                    qualify_table_name(&config.database, &config.close_positions_table),
+                    error
                 ));
             }
             eprintln!(
-                "Failed to flush {} close-position event(s) to ClickHouse: {error}",
-                close_positions_batch.len()
+                "Failed to flush {} close-position event(s) to ClickHouse: {:#}",
+                close_positions_batch.len(),
+                error
             );
         } else {
             metrics
@@ -437,16 +469,18 @@ async fn flush_batches(
 
 async fn flush_market_updates(
     client: &Client,
+    database: &str,
     table: &str,
     batch: &[MarketUpdateEventRecord],
 ) -> Result<()> {
+    let qualified_table = qualify_table_name(database, table);
     let table_with_columns = format!(
         "{} (event_uid, signature, event_index, slot, market_id, base_flow, quote_flow)",
-        table
+        qualified_table
     );
     let mut insert = client
         .insert::<MarketUpdateInsertRow>(&table_with_columns)
-        .with_context(|| format!("Failed to start ClickHouse insert for table {table}"))?;
+        .with_context(|| format!("Failed to start ClickHouse insert for table {qualified_table}"))?;
 
     for event in batch {
         let row = MarketUpdateInsertRow {
@@ -461,28 +495,38 @@ async fn flush_market_updates(
         insert
             .write(&row)
             .await
-            .with_context(|| format!("Failed to write market-update row into table {table}"))?;
+            .with_context(|| {
+                format!(
+                    "Failed to write market-update row into table {qualified_table}"
+                )
+            })?;
     }
 
     insert
         .end()
         .await
-        .with_context(|| format!("Failed to finalize market-update insert into table {table}"))?;
+        .with_context(|| {
+            format!(
+                "Failed to finalize market-update insert into table {qualified_table}"
+            )
+        })?;
     Ok(())
 }
 
 async fn flush_close_positions(
     client: &Client,
+    database: &str,
     table: &str,
     batch: &[ClosePositionEventRecord],
 ) -> Result<()> {
+    let qualified_table = qualify_table_name(database, table);
     let table_with_columns = format!(
         "{} (event_uid, signature, event_index, slot, position_authority, market_id, start_slot, end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy)",
-        table
+        qualified_table
     );
     let mut insert = client
         .insert::<ClosePositionInsertRow>(&table_with_columns)
-        .with_context(|| format!("Failed to start ClickHouse insert for table {table}"))?;
+        .with_context(|| format!("Failed to start ClickHouse insert for table {qualified_table}"))?;
 
     for event in batch {
         let row = ClosePositionInsertRow {
@@ -503,12 +547,44 @@ async fn flush_close_positions(
         insert
             .write(&row)
             .await
-            .with_context(|| format!("Failed to write close-position row into table {table}"))?;
+            .with_context(|| {
+                format!(
+                    "Failed to write close-position row into table {qualified_table}"
+                )
+            })?;
     }
 
     insert
         .end()
         .await
-        .with_context(|| format!("Failed to finalize close-position insert into table {table}"))?;
+        .with_context(|| {
+            format!(
+                "Failed to finalize close-position insert into table {qualified_table}"
+            )
+        })?;
     Ok(())
+}
+
+fn qualify_table_name(database: &str, table: &str) -> String {
+    if table.contains('.') {
+        table.to_string()
+    } else {
+        format!("{database}.{table}")
+    }
+}
+
+async fn ensure_table_exists(client: &Client, database: &str, table: &str) -> Result<()> {
+    let qualified_table = qualify_table_name(database, table);
+    let query = format!("EXISTS TABLE {qualified_table}");
+    let exists = client
+        .query(&query)
+        .fetch_one::<u8>()
+        .await
+        .with_context(|| format!("Failed to check table existence with query: {query}"))?;
+
+    if exists == 1 {
+        Ok(())
+    } else {
+        Err(anyhow!("Table does not exist: {qualified_table}"))
+    }
 }
