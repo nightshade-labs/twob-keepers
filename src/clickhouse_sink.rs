@@ -474,12 +474,8 @@ async fn flush_market_updates(
     batch: &[MarketUpdateEventRecord],
 ) -> Result<()> {
     let qualified_table = qualify_table_name(database, table);
-    let table_with_columns = format!(
-        "{} (event_uid, signature, event_index, slot, market_id, base_flow, quote_flow)",
-        qualified_table
-    );
     let mut insert = client
-        .insert::<MarketUpdateInsertRow>(&table_with_columns)
+        .insert::<MarketUpdateInsertRow>(&qualified_table)
         .with_context(|| format!("Failed to start ClickHouse insert for table {qualified_table}"))?;
 
     for event in batch {
@@ -520,12 +516,8 @@ async fn flush_close_positions(
     batch: &[ClosePositionEventRecord],
 ) -> Result<()> {
     let qualified_table = qualify_table_name(database, table);
-    let table_with_columns = format!(
-        "{} (event_uid, signature, event_index, slot, position_authority, market_id, start_slot, end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy)",
-        qualified_table
-    );
     let mut insert = client
-        .insert::<ClosePositionInsertRow>(&table_with_columns)
+        .insert::<ClosePositionInsertRow>(&qualified_table)
         .with_context(|| format!("Failed to start ClickHouse insert for table {qualified_table}"))?;
 
     for event in batch {
