@@ -25,13 +25,13 @@ SELECT
     toStartOfMinute(event_time) AS bucket_start,
 
     argMinState(
-        abs(toFloat64(quote_flow)) / nullIf(abs(toFloat64(base_flow)), 0.0),
+        abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)),
         tuple(event_time, slot, event_uid)
     ) AS open_state,
-    maxState(abs(toFloat64(quote_flow)) / nullIf(abs(toFloat64(base_flow)), 0.0)) AS high_state,
-    minState(abs(toFloat64(quote_flow)) / nullIf(abs(toFloat64(base_flow)), 0.0)) AS low_state,
+    maxState(abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow))) AS high_state,
+    minState(abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow))) AS low_state,
     argMaxState(
-        abs(toFloat64(quote_flow)) / nullIf(abs(toFloat64(base_flow)), 0.0),
+        abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)),
         tuple(event_time, slot, event_uid)
     ) AS close_state,
 

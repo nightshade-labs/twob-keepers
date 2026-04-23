@@ -347,7 +347,7 @@ async fn get_latest_price(
         "SELECT \
             slot, \
             toUnixTimestamp64Milli(event_time) AS event_time_ms, \
-            abs(toFloat64(quote_flow)) / nullIf(abs(toFloat64(base_flow)), 0.0) AS raw_price \
+            abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
          FROM {} \
          WHERE market_id = ? AND base_flow != 0 \
          ORDER BY slot DESC, event_index DESC \
