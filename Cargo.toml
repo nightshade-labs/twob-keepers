@@ -8,7 +8,9 @@ anchor-client = { version = "0.32.1", features = ["async"] }
 anchor-lang = "0.32.1"
 anchor-spl = "0.32.1"
 anyhow = "1.0.93"
+axum = { version = "0.8.1", features = ["json", "macros"] }
 base64 = "0.22.1"
+chrono = { version = "0.4.38", features = ["serde"] }
 clickhouse = "0.13"
 deadpool-postgres = "0.14"
 dotenv = "0.15.0"
@@ -19,3 +21,4 @@ solana-pubsub-client = "2.3.13"
 solana-rpc-client-types = "2.3.13"
 tokio = { version = "1.0", features = ["full"] }
 tokio-postgres = "0.7.15"
+tower-http = { version = "0.6.2", features = ["cors"] }

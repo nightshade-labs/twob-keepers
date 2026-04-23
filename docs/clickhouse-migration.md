@@ -982,12 +982,12 @@ If starting tomorrow, I would build in this order:
 1. Add `event_uid` and `event_index` to keeper event output.
 2. Add ClickHouse raw tables.
 3. Dual-write `event-keeper` to Supabase and ClickHouse.
-4. Build `GET /v1/markets/:marketId/price`.
-5. Build `GET /v1/markets/:marketId/updates/range`.
-6. Switch `mato-ui` to backend HTTP.
-7. Switch `mato-mobile` to backend HTTP and keep polling.
-8. Add `market_update_ticks`.
-9. Add candle materialized views.
+4. Add `market_candles_1m` rollup + materialized view.
+5. Build `GET /v1/markets/:marketId/price`.
+6. Build `GET /v1/markets/:marketId/candles`.
+7. Switch `mato-ui` chart reads to candle endpoint.
+8. Switch `mato-mobile` chart reads to candle endpoint.
+9. Add optional `/updates/range` only where still needed.
 10. Move monitoring snapshots next.
 
 This is the shortest path that reduces risk while still moving the important data to ClickHouse quickly.
@@ -996,12 +996,17 @@ This is the shortest path that reduces risk while still moving the important dat
 
 The current `event-keeper` implementation supports optional dual-write:
 
-- Postgres sink is always enabled.
-- ClickHouse sink is enabled only when `CLICKHOUSE_URL` is set.
+- Postgres sink is enabled when `DATABASE_URL` is set.
+- ClickHouse sink is enabled when `CLICKHOUSE_URL` is set.
+- You can run with only one sink or with both.
 
 ### Required for ClickHouse sink
 
 - `CLICKHOUSE_URL`
+
+### Optional for Postgres sink
+
+- `DATABASE_URL`
 
 ### Optional for ClickHouse sink
 
@@ -1017,6 +1022,42 @@ The current `event-keeper` implementation supports optional dual-write:
 Use the table bootstrap script in:
 
 - `/Users/thgehr/development/mato/twob-keepers/docs/clickhouse-events-schema.sql`
+- `/Users/thgehr/development/mato/twob-keepers/docs/clickhouse-candles-schema.sql`
+- `/Users/thgehr/development/mato/twob-keepers/docs/clickhouse-candles-backfill.sql` (one-time)
+
+After creating the candle materialized view, run the one-time backfill script
+`clickhouse-candles-backfill.sql` so existing raw events are visible in candle queries.
+
+## 14. Read API (implemented)
+
+The repository now includes a `read-api` binary:
+
+- `/Users/thgehr/development/mato/twob-keepers/src/bin/read-api/main.rs`
+
+### Endpoints
+
+- `GET /healthz`
+- `GET /v1/markets/:marketId/price`
+- `GET /v1/markets/:marketId/candles?from=2026-04-22T00:00:00Z&to=2026-04-22T12:00:00Z&interval=5m&max_points=1500`
+
+### Why this avoids the old slowdown
+
+- chart queries no longer page raw events in client code
+- server enforces `max_points` and validates interval windows
+- long-range candles are aggregated from `market_candles_1m` rollups, not from full raw event scans
+- decimals are resolved server-side from `market_configs` (no frontend query params)
+
+### Read API env vars
+
+- `READ_API_BIND_ADDR` (default: `0.0.0.0:8080`)
+- `READ_API_CONFIG_DATABASE_URL` (optional override; falls back to `DATABASE_URL`)
+- `READ_API_MARKET_CONFIG_CACHE_TTL_SECS` (default: `300`)
+- `CLICKHOUSE_URL` (required)
+- `CLICKHOUSE_DATABASE` (default: `mato`)
+- `CLICKHOUSE_USER` (default: `default`)
+- `CLICKHOUSE_PASSWORD` (default: empty)
+- `CLICKHOUSE_MARKET_UPDATES_TABLE` (default: `raw_market_update_events`)
+- `CLICKHOUSE_CANDLES_1M_TABLE` (default: `market_candles_1m`)
 
 ## 13. Sink observability
 
