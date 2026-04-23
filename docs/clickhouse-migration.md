@@ -1038,6 +1038,7 @@ The repository now includes a `read-api` binary:
 
 - `GET /healthz`
 - `GET /v1/markets/:marketId/price`
+- `GET /v1/markets/:marketId/stream` (Server-Sent Events, `event: price_update`)
 - `GET /v1/markets/:marketId/candles?from=2026-04-22T00:00:00Z&to=2026-04-22T12:00:00Z&interval=5m&max_points=1500`
 
 ### Why this avoids the old slowdown
@@ -1046,12 +1047,14 @@ The repository now includes a `read-api` binary:
 - server enforces `max_points` and validates interval windows
 - long-range candles are aggregated from `market_candles_1m` rollups, not from full raw event scans
 - decimals are resolved server-side from `market_configs` (no frontend query params)
+- live price updates are pushed over SSE so clients do not need to poll `/price`
 
 ### Read API env vars
 
 - `READ_API_BIND_ADDR` (default: `0.0.0.0:8080`)
 - `READ_API_CONFIG_DATABASE_URL` (optional override; falls back to `DATABASE_URL`)
 - `READ_API_MARKET_CONFIG_CACHE_TTL_SECS` (default: `300`)
+- `READ_API_PRICE_STREAM_POLL_MS` (default: `1000`; backend polling interval per active market stream)
 - `CLICKHOUSE_URL` (required)
 - `CLICKHOUSE_DATABASE` (default: `mato`)
 - `CLICKHOUSE_USER` (default: `default`)

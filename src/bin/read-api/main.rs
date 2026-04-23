@@ -3,21 +3,29 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::get,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use clickhouse::{Client, Row};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use futures_util::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    convert::Infallible,
     env,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::{
+    sync::{RwLock, broadcast},
+    time::MissedTickBehavior,
+};
 use tokio_postgres::NoTls;
 use tower_http::cors::CorsLayer;
 
@@ -29,12 +37,14 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
 const DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_PRICE_STREAM_POLL_MS: u64 = 1000;
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
     config: ReadApiConfig,
     market_config_store: MarketConfigStore,
+    market_price_streams: MarketPriceStreams,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +53,7 @@ struct ReadApiConfig {
     market_updates_table: String,
     candles_1m_table: String,
     market_config_cache_ttl: Duration,
+    price_stream_poll_interval: Duration,
 }
 
 impl ReadApiConfig {
@@ -73,6 +84,10 @@ impl ReadApiConfig {
             "READ_API_MARKET_CONFIG_CACHE_TTL_SECS",
             DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS,
         )?);
+        let price_stream_poll_interval = Duration::from_millis(parse_u64_env(
+            "READ_API_PRICE_STREAM_POLL_MS",
+            DEFAULT_PRICE_STREAM_POLL_MS,
+        )?);
 
         let client = Client::default()
             .with_url(url.trim())
@@ -86,6 +101,7 @@ impl ReadApiConfig {
                 market_updates_table,
                 candles_1m_table,
                 market_config_cache_ttl,
+                price_stream_poll_interval,
             },
             client,
         ))
@@ -143,10 +159,7 @@ struct HealthResponse {
     status: &'static str,
 }
 
-#[derive(Deserialize)]
-struct PriceQuery {}
-
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct LatestPriceResponse {
     market_id: u64,
     slot: u64,
@@ -232,6 +245,20 @@ struct CachedMarketDecimals {
     decimals: MarketDecimals,
 }
 
+#[derive(Clone)]
+struct MarketPriceStreams {
+    channels: Arc<RwLock<HashMap<u64, broadcast::Sender<LatestPriceResponse>>>>,
+    runtime: PriceStreamRuntime,
+    poll_interval: Duration,
+}
+
+#[derive(Clone)]
+struct PriceStreamRuntime {
+    client: Client,
+    market_updates_table: String,
+    market_config_store: MarketConfigStore,
+}
+
 #[derive(Debug)]
 struct MarketConfigNotFound {
     market_id: u64,
@@ -293,6 +320,12 @@ async fn main() -> Result<()> {
 
     let (config, client) = ReadApiConfig::from_env()?;
     let market_config_store = MarketConfigStore::from_env(config.market_config_cache_ttl).await?;
+    let market_price_streams = MarketPriceStreams::new(
+        client.clone(),
+        config.market_updates_table.clone(),
+        market_config_store.clone(),
+        config.price_stream_poll_interval,
+    );
 
     client
         .query("SELECT 1")
@@ -307,11 +340,13 @@ async fn main() -> Result<()> {
         client,
         config: config.clone(),
         market_config_store,
+        market_price_streams,
     });
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/markets/{market_id}/price", get(get_latest_price))
+        .route("/v1/markets/{market_id}/stream", get(stream_market_price))
         .route("/v1/markets/{market_id}/candles", get(get_candles))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -334,49 +369,70 @@ async fn healthz() -> Json<HealthResponse> {
 async fn get_latest_price(
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<u64>,
-    _query: Query<PriceQuery>,
 ) -> Result<Json<LatestPriceResponse>, ApiError> {
-    let decimals = state
+    let maybe_snapshot = fetch_latest_price_snapshot(
+        &state.client,
+        &state.config.market_updates_table,
+        &state.market_config_store,
+        market_id,
+    )
+    .await
+    .map_err(map_latest_price_error)?;
+
+    let snapshot = maybe_snapshot
+        .ok_or_else(|| ApiError::not_found(format!("No market updates found for market_id={market_id}")))?;
+
+    Ok(Json(snapshot))
+}
+
+async fn stream_market_price(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<u64>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    // Fail early with 404 if market config does not exist.
+    state
         .market_config_store
         .get_market_decimals(market_id)
         .await
         .map_err(map_market_config_error)?;
-    let price_scale = price_scale(decimals.base_decimals, decimals.quote_decimals);
 
-    let sql = format!(
-        "SELECT \
-            slot, \
-            toUnixTimestamp64Milli(event_time) AS event_time_ms, \
-            abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
-         FROM {} \
-         WHERE market_id = ? AND base_flow != 0 \
-         ORDER BY slot DESC, event_index DESC \
-         LIMIT 1",
-        state.config.market_updates_table
-    );
+    let receiver = state.market_price_streams.subscribe(market_id).await;
 
-    let rows = state
-        .client
-        .query(&sql)
-        .bind(market_id)
-        .fetch_all::<LatestPriceRow>()
-        .await
-        .map_err(|error| ApiError::internal(anyhow!(error).context("Failed to query latest price")))?;
+    let event_stream = stream::unfold(receiver, move |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(snapshot) => {
+                    let event = match Event::default()
+                        .event("price_update")
+                        .json_data(&snapshot)
+                    {
+                        Ok(event) => event,
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to encode price_update SSE payload for market_id={}: {}",
+                                market_id, error
+                            );
+                            continue;
+                        }
+                    };
+                    return Some((Ok::<Event, Infallible>(event), receiver));
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "Price stream lagged for market_id={}; skipped {} event(s)",
+                        market_id, skipped
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
 
-    let row = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::not_found(format!("No market updates found for market_id={market_id}")))?;
-
-    let event_time = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms)
-        .ok_or_else(|| ApiError::internal(anyhow!("Invalid event_time_ms {}", row.event_time_ms)))?;
-
-    Ok(Json(LatestPriceResponse {
-        market_id,
-        slot: row.slot,
-        event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
-        price: row.raw_price * price_scale,
-    }))
+    Ok(Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
 }
 
 async fn get_candles(
@@ -501,6 +557,147 @@ async fn get_candles(
         points: items.len(),
         items,
     }))
+}
+
+async fn fetch_latest_price_snapshot(
+    client: &Client,
+    market_updates_table: &str,
+    market_config_store: &MarketConfigStore,
+    market_id: u64,
+) -> Result<Option<LatestPriceResponse>> {
+    let decimals = market_config_store.get_market_decimals(market_id).await?;
+    let price_scale = price_scale(decimals.base_decimals, decimals.quote_decimals);
+    let maybe_row = query_latest_price_row(client, market_updates_table, market_id).await?;
+
+    maybe_row
+        .map(|row| latest_price_response_from_row(market_id, row, price_scale))
+        .transpose()
+}
+
+async fn query_latest_price_row(
+    client: &Client,
+    market_updates_table: &str,
+    market_id: u64,
+) -> Result<Option<LatestPriceRow>> {
+    let sql = format!(
+        "SELECT \
+            slot, \
+            toUnixTimestamp64Milli(event_time) AS event_time_ms, \
+            abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
+         FROM {} \
+         WHERE market_id = ? AND base_flow != 0 \
+         ORDER BY slot DESC, event_index DESC \
+         LIMIT 1",
+        market_updates_table
+    );
+
+    let rows = client
+        .query(&sql)
+        .bind(market_id)
+        .fetch_all::<LatestPriceRow>()
+        .await
+        .context("Failed to query latest price")?;
+
+    Ok(rows.into_iter().next())
+}
+
+fn latest_price_response_from_row(
+    market_id: u64,
+    row: LatestPriceRow,
+    price_scale: f64,
+) -> Result<LatestPriceResponse> {
+    let event_time = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms)
+        .ok_or_else(|| anyhow!("Invalid event_time_ms {}", row.event_time_ms))?;
+
+    Ok(LatestPriceResponse {
+        market_id,
+        slot: row.slot,
+        event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
+        price: row.raw_price * price_scale,
+    })
+}
+
+impl MarketPriceStreams {
+    fn new(
+        client: Client,
+        market_updates_table: String,
+        market_config_store: MarketConfigStore,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            runtime: PriceStreamRuntime {
+                client,
+                market_updates_table,
+                market_config_store,
+            },
+            poll_interval,
+        }
+    }
+
+    async fn subscribe(&self, market_id: u64) -> broadcast::Receiver<LatestPriceResponse> {
+        {
+            let channels = self.channels.read().await;
+            if let Some(sender) = channels.get(&market_id) {
+                return sender.subscribe();
+            }
+        }
+
+        let mut channels = self.channels.write().await;
+        if let Some(sender) = channels.get(&market_id) {
+            return sender.subscribe();
+        }
+
+        let (sender, _receiver) = broadcast::channel::<LatestPriceResponse>(512);
+        let runtime = self.runtime.clone();
+        let sender_for_task = sender.clone();
+        let poll_interval = self.poll_interval;
+        tokio::spawn(async move {
+            run_market_price_stream(runtime, market_id, sender_for_task, poll_interval).await;
+        });
+
+        channels.insert(market_id, sender.clone());
+        sender.subscribe()
+    }
+}
+
+async fn run_market_price_stream(
+    runtime: PriceStreamRuntime,
+    market_id: u64,
+    sender: broadcast::Sender<LatestPriceResponse>,
+    poll_interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(poll_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut latest_slot: Option<u64> = None;
+
+    loop {
+        match fetch_latest_price_snapshot(
+            &runtime.client,
+            &runtime.market_updates_table,
+            &runtime.market_config_store,
+            market_id,
+        )
+        .await
+        {
+            Ok(Some(snapshot)) => {
+                let is_newer = latest_slot.map(|slot| snapshot.slot > slot).unwrap_or(true);
+                if is_newer {
+                    latest_slot = Some(snapshot.slot);
+                    let _ = sender.send(snapshot);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "Price stream polling error for market_id={}: {:#}",
+                    market_id, error
+                );
+            }
+        }
+
+        ticker.tick().await;
+    }
 }
 
 fn first_env_value(keys: &[&str]) -> Option<String> {
@@ -683,6 +880,16 @@ fn map_market_config_error(error: anyhow::Error) -> ApiError {
             not_found.market_id
         )),
         None => ApiError::internal(error.context("Failed to resolve market config")),
+    }
+}
+
+fn map_latest_price_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<MarketConfigNotFound>() {
+        Some(not_found) => ApiError::not_found(format!(
+            "No market config found for market_id={}",
+            not_found.market_id
+        )),
+        None => ApiError::internal(error.context("Failed to fetch latest price snapshot")),
     }
 }
 
