@@ -38,6 +38,8 @@ const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
 const DEFAULT_HISTORY_MAX_ROWS: usize = 25_000;
 const ABSOLUTE_MAX_HISTORY_ROWS: usize = 200_000;
+const DEFAULT_UPDATES_LIMIT: usize = 200;
+const ABSOLUTE_MAX_UPDATES_LIMIT: usize = 5000;
 const DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_PRICE_STREAM_POLL_MS: u64 = 1000;
 const MAX_SUPPORTED_TOKEN_DECIMALS: u8 = 18;
@@ -194,6 +196,12 @@ struct MarketHistoryQuery {
     max_rows: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct MarketUpdatesQuery {
+    before_slot: Option<u64>,
+    limit: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct CandleResponse {
     market_id: u64,
@@ -233,6 +241,16 @@ struct MarketHistoryResponse {
     market_id: u64,
     start_slot: u64,
     end_slot: u64,
+    points: usize,
+    items: Vec<MarketHistoryItem>,
+}
+
+#[derive(Serialize)]
+struct MarketUpdatesResponse {
+    market_id: u64,
+    before_slot: Option<u64>,
+    has_more: bool,
+    limit: usize,
     points: usize,
     items: Vec<MarketHistoryItem>,
 }
@@ -394,6 +412,7 @@ async fn main() -> Result<()> {
         .route("/v1/markets/{market_id}/stream", get(stream_market_price))
         .route("/v1/markets/{market_id}/candles", get(get_candles))
         .route("/v1/markets/{market_id}/history", get(get_market_history))
+        .route("/v1/markets/{market_id}/updates", get(get_market_updates))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -652,30 +671,55 @@ async fn get_market_history(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let created_at = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
-            ApiError::internal(anyhow!(
-                "Invalid event_time_ms {} for event_uid={}",
-                row.event_time_ms,
-                row.event_uid
-            ))
-        })?;
-
-        items.push(MarketHistoryItem {
-            event_uid: row.event_uid,
-            signature: row.signature,
-            event_index: row.event_index,
-            slot: row.slot,
-            market_id: row.market_id,
-            base_flow: row.base_flow.to_string(),
-            quote_flow: row.quote_flow.to_string(),
-            created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        });
+        items.push(market_history_item_from_row(row)?);
     }
 
     Ok(Json(MarketHistoryResponse {
         market_id,
         start_slot: query.start_slot,
         end_slot: query.end_slot,
+        points: items.len(),
+        items,
+    }))
+}
+
+async fn get_market_updates(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<u64>,
+    Query(query): Query<MarketUpdatesQuery>,
+) -> Result<Json<MarketUpdatesResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_UPDATES_LIMIT);
+    if limit == 0 || limit > ABSOLUTE_MAX_UPDATES_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {ABSOLUTE_MAX_UPDATES_LIMIT}"
+        )));
+    }
+
+    let mut rows = query_market_updates_rows(
+        &state.client,
+        &state.config.market_updates_table,
+        market_id,
+        query.before_slot,
+        limit.saturating_add(1),
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.context("Failed to query market updates")))?;
+
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        items.push(market_history_item_from_row(row)?);
+    }
+
+    Ok(Json(MarketUpdatesResponse {
+        market_id,
+        before_slot: query.before_slot,
+        has_more,
+        limit,
         points: items.len(),
         items,
     }))
@@ -823,6 +867,74 @@ async fn query_market_history_rows(
             .then(left.event_index.cmp(&right.event_index))
     });
     Ok(anchor_rows)
+}
+
+async fn query_market_updates_rows(
+    client: &Client,
+    market_updates_table: &str,
+    market_id: u64,
+    before_slot: Option<u64>,
+    limit: usize,
+) -> Result<Vec<MarketHistoryRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut sql = format!(
+        "SELECT \
+            event_uid, \
+            signature, \
+            event_index, \
+            slot, \
+            market_id, \
+            base_flow, \
+            quote_flow, \
+            toUnixTimestamp64Milli(event_time) AS event_time_ms \
+         FROM {} \
+         WHERE market_id = ? \
+           AND NOT startsWith(event_uid, 'debug:')",
+        market_updates_table
+    );
+
+    if before_slot.is_some() {
+        sql.push_str(" AND slot < ?");
+    }
+
+    sql.push_str(" ORDER BY slot DESC, event_index DESC LIMIT ?");
+
+    let mut query = client.query(&sql).bind(market_id);
+    if let Some(before_slot) = before_slot {
+        query = query.bind(before_slot);
+    }
+
+    let rows = query
+        .bind(limit as u64)
+        .fetch_all::<MarketHistoryRow>()
+        .await
+        .context("Failed to query market updates rows")?;
+
+    Ok(rows)
+}
+
+fn market_history_item_from_row(row: MarketHistoryRow) -> Result<MarketHistoryItem, ApiError> {
+    let created_at = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
+        ApiError::internal(anyhow!(
+            "Invalid event_time_ms {} for event_uid={}",
+            row.event_time_ms,
+            row.event_uid
+        ))
+    })?;
+
+    Ok(MarketHistoryItem {
+        event_uid: row.event_uid,
+        signature: row.signature,
+        event_index: row.event_index,
+        slot: row.slot,
+        market_id: row.market_id,
+        base_flow: row.base_flow.to_string(),
+        quote_flow: row.quote_flow.to_string(),
+        created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
 }
 
 fn latest_price_response_from_row(
