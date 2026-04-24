@@ -1028,14 +1028,14 @@ async fn query_closed_position_mini_chart_rows(
 
     let anchor_sql = format!(
         "SELECT \
-            slot, \
-            abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
-         FROM {} \
-         WHERE market_id = ? \
-           AND base_flow != 0 \
-           AND slot < ? \
-           AND NOT startsWith(event_uid, 'debug:') \
-         ORDER BY slot DESC, event_index DESC \
+            events.slot AS slot, \
+            abs(toFloat64(events.quote_flow)) / abs(toFloat64(events.base_flow)) AS raw_price \
+         FROM {} AS events \
+         WHERE events.market_id = ? \
+           AND events.base_flow != 0 \
+           AND events.slot < ? \
+           AND NOT startsWith(events.event_uid, 'debug:') \
+         ORDER BY events.slot DESC, events.event_index DESC \
          LIMIT 1",
         market_updates_table
     );
@@ -1050,18 +1050,18 @@ async fn query_closed_position_mini_chart_rows(
 
     let sampled_sql = format!(
         "SELECT \
-            min(slot) AS slot, \
+            min(events.slot) AS slot, \
             argMin( \
-                abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)), \
-                tuple(slot, event_index) \
+                abs(toFloat64(events.quote_flow)) / abs(toFloat64(events.base_flow)), \
+                tuple(events.slot, events.event_index) \
             ) AS raw_price \
-         FROM {} \
-         WHERE market_id = ? \
-           AND base_flow != 0 \
-           AND slot >= ? \
-           AND slot <= ? \
-           AND NOT startsWith(event_uid, 'debug:') \
-         GROUP BY intDiv(slot - ?, ?) \
+         FROM {} AS events \
+         WHERE events.market_id = ? \
+           AND events.base_flow != 0 \
+           AND events.slot >= ? \
+           AND events.slot <= ? \
+           AND NOT startsWith(events.event_uid, 'debug:') \
+         GROUP BY intDiv(events.slot - ?, ?) \
          ORDER BY slot ASC \
          LIMIT ?",
         market_updates_table
