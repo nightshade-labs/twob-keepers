@@ -26,7 +26,7 @@ use tokio::{
     sync::{RwLock, broadcast},
     time::MissedTickBehavior,
 };
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, SimpleQueryMessage};
 use tower_http::cors::CorsLayer;
 
 const DEFAULT_CLICKHOUSE_DATABASE: &str = "mato";
@@ -828,8 +828,8 @@ impl MarketConfigStore {
             .get()
             .await
             .context("Failed to get market-config DB connection")?;
-        let _ = client
-            .query_one("SELECT 1", &[])
+        client
+            .simple_query("SELECT 1")
             .await
             .context("Failed to verify market-config DB connection")?;
 
@@ -858,42 +858,52 @@ impl MarketConfigStore {
             .context("Failed to get market-config DB connection")?;
         let max_decimals = i32::from(MAX_SUPPORTED_TOKEN_DECIMALS);
         let max_diff = MAX_SUPPORTED_DECIMAL_DIFFERENCE;
-        let row = client
-            .query_opt(
-                "SELECT base_decimals::int4, quote_decimals::int4
-                 FROM market_configs
-                 WHERE market_id = $1
-                   AND base_decimals::int4 BETWEEN 0 AND $2
-                   AND quote_decimals::int4 BETWEEN 0 AND $2
-                   AND abs(base_decimals::int4 - quote_decimals::int4) <= $3
-                 ORDER BY id DESC
-                 LIMIT 1",
-                &[&(market_id as i64), &max_decimals, &max_diff],
-            )
+        let valid_row_sql = format!(
+            "SELECT base_decimals::int4::text AS base_decimals, quote_decimals::int4::text AS quote_decimals \
+             FROM market_configs \
+             WHERE market_id = {} \
+               AND base_decimals::int4 BETWEEN 0 AND {} \
+               AND quote_decimals::int4 BETWEEN 0 AND {} \
+               AND abs(base_decimals::int4 - quote_decimals::int4) <= {} \
+             ORDER BY id DESC \
+             LIMIT 1",
+            market_id, max_decimals, max_decimals, max_diff
+        );
+
+        let valid_rows = client
+            .simple_query(&valid_row_sql)
             .await
             .with_context(|| format!("Failed to query market_configs for market_id={market_id}"))?;
+        let row = find_first_simple_query_row(&valid_rows);
 
         let row = match row {
             Some(row) => row,
             None => {
-                let latest_row = client
-                    .query_opt(
-                        "SELECT id::text, base_decimals::int4, quote_decimals::int4
-                         FROM market_configs
-                         WHERE market_id = $1
-                         ORDER BY id DESC
-                         LIMIT 1",
-                        &[&(market_id as i64)],
-                    )
+                let latest_row_sql = format!(
+                    "SELECT id::text AS id, base_decimals::int4::text AS base_decimals, quote_decimals::int4::text AS quote_decimals \
+                     FROM market_configs \
+                     WHERE market_id = {} \
+                     ORDER BY id DESC \
+                     LIMIT 1",
+                    market_id
+                );
+                let latest_rows = client
+                    .simple_query(&latest_row_sql)
                     .await
                     .with_context(|| {
                         format!("Failed to inspect latest market_configs row for market_id={market_id}")
                     })?;
 
-                if let Some(latest_row) = latest_row {
-                    let latest_id: String = latest_row.get(0);
-                    let latest_base_decimals: i32 = latest_row.get(1);
-                    let latest_quote_decimals: i32 = latest_row.get(2);
+                if let Some(latest_row) = find_first_simple_query_row(&latest_rows) {
+                    let latest_id = latest_row.get(0).unwrap_or("<missing>");
+                    let latest_base_decimals = latest_row
+                        .get(1)
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or_default();
+                    let latest_quote_decimals = latest_row
+                        .get(2)
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .unwrap_or_default();
                     return Err(anyhow!(
                         "No valid market_configs row for market_id={market_id}. Latest row id={} has base_decimals={} quote_decimals={} (allowed range: 0..={}, max abs diff: {})",
                         latest_id,
@@ -908,8 +918,16 @@ impl MarketConfigStore {
             }
         };
 
-        let base_decimals_i32: i32 = row.get(0);
-        let quote_decimals_i32: i32 = row.get(1);
+        let base_decimals_i32 = row
+            .get(0)
+            .ok_or_else(|| anyhow!("Missing base_decimals in market_configs row"))?
+            .parse::<i32>()
+            .context("Failed to parse base_decimals in market_configs row")?;
+        let quote_decimals_i32 = row
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing quote_decimals in market_configs row"))?
+            .parse::<i32>()
+            .context("Failed to parse quote_decimals in market_configs row")?;
         let base_decimals =
             u8::try_from(base_decimals_i32).context("Invalid base_decimals in market_configs")?;
         let quote_decimals =
@@ -999,4 +1017,13 @@ fn sanitize_chart_volume(value: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn find_first_simple_query_row(
+    messages: &[SimpleQueryMessage],
+) -> Option<&tokio_postgres::SimpleQueryRow> {
+    messages.iter().find_map(|message| match message {
+        SimpleQueryMessage::Row(row) => Some(row),
+        _ => None,
+    })
 }
