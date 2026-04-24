@@ -38,6 +38,9 @@ const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
 const DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_PRICE_STREAM_POLL_MS: u64 = 1000;
+const MAX_SUPPORTED_TOKEN_DECIMALS: u8 = 18;
+const MAX_SUPPORTED_DECIMAL_DIFFERENCE: i32 = 18;
+const MAX_LIGHTWEIGHT_CHART_ABS_VALUE: f64 = 90_071_992_547_409.91;
 
 #[derive(Clone)]
 struct AppState {
@@ -491,7 +494,7 @@ async fn get_candles(
             GROUP BY bucket_start \
         ) \
         SELECT \
-            toUnixTimestamp(bucket_time) AS time, \
+            toUInt64(intDiv(toUnixTimestamp64Milli(bucket_time), 1000)) AS time, \
             min(start_slot) AS start_slot, \
             max(end_slot) AS end_slot, \
             argMin(open_price, bucket_start) * ? AS open, \
@@ -535,19 +538,35 @@ async fn get_candles(
         .await
         .map_err(|error| ApiError::internal(anyhow!(error).context("Failed to query candles")))?;
 
-    let items = rows
-        .into_iter()
-        .map(|row| CandleItem {
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !is_valid_chart_price(row.open)
+            || !is_valid_chart_price(row.high)
+            || !is_valid_chart_price(row.low)
+            || !is_valid_chart_price(row.close)
+        {
+            eprintln!(
+                "Dropping invalid candle row for market_id={}: time={} open={} high={} low={} close={}",
+                market_id, row.time, row.open, row.high, row.low, row.close
+            );
+            continue;
+        }
+
+        let normalized_high = row.open.max(row.high).max(row.low).max(row.close);
+        let normalized_low = row.open.min(row.high).min(row.low).min(row.close);
+        let volume = sanitize_chart_volume(row.volume);
+
+        items.push(CandleItem {
             time: row.time,
             start_slot: row.start_slot,
             end_slot: row.end_slot,
             open: row.open,
-            high: row.high,
-            low: row.low,
+            high: normalized_high,
+            low: normalized_low,
             close: row.close,
-            volume: row.volume,
-        })
-        .collect::<Vec<_>>();
+            volume,
+        });
+    }
 
     Ok(Json(CandleResponse {
         market_id,
@@ -609,11 +628,19 @@ fn latest_price_response_from_row(
     let event_time = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms)
         .ok_or_else(|| anyhow!("Invalid event_time_ms {}", row.event_time_ms))?;
 
+    let scaled_price = row.raw_price * price_scale;
+    if !is_valid_chart_price(scaled_price) {
+        return Err(anyhow!(
+            "Latest price out of supported range for market_id={market_id}: {}",
+            scaled_price
+        ));
+    }
+
     Ok(LatestPriceResponse {
         market_id,
         slot: row.slot,
         event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
-        price: row.raw_price * price_scale,
+        price: scaled_price,
     })
 }
 
@@ -829,21 +856,56 @@ impl MarketConfigStore {
             .get()
             .await
             .context("Failed to get market-config DB connection")?;
+        let max_decimals = i32::from(MAX_SUPPORTED_TOKEN_DECIMALS);
+        let max_diff = MAX_SUPPORTED_DECIMAL_DIFFERENCE;
         let row = client
             .query_opt(
                 "SELECT base_decimals::int4, quote_decimals::int4
                  FROM market_configs
                  WHERE market_id = $1
+                   AND base_decimals::int4 BETWEEN 0 AND $2
+                   AND quote_decimals::int4 BETWEEN 0 AND $2
+                   AND abs(base_decimals::int4 - quote_decimals::int4) <= $3
                  ORDER BY id DESC
                  LIMIT 1",
-                &[&(market_id as i64)],
+                &[&(market_id as i64), &max_decimals, &max_diff],
             )
             .await
             .with_context(|| format!("Failed to query market_configs for market_id={market_id}"))?;
 
         let row = match row {
             Some(row) => row,
-            None => return Err(MarketConfigNotFound { market_id }.into()),
+            None => {
+                let latest_row = client
+                    .query_opt(
+                        "SELECT id::text, base_decimals::int4, quote_decimals::int4
+                         FROM market_configs
+                         WHERE market_id = $1
+                         ORDER BY id DESC
+                         LIMIT 1",
+                        &[&(market_id as i64)],
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to inspect latest market_configs row for market_id={market_id}")
+                    })?;
+
+                if let Some(latest_row) = latest_row {
+                    let latest_id: String = latest_row.get(0);
+                    let latest_base_decimals: i32 = latest_row.get(1);
+                    let latest_quote_decimals: i32 = latest_row.get(2);
+                    return Err(anyhow!(
+                        "No valid market_configs row for market_id={market_id}. Latest row id={} has base_decimals={} quote_decimals={} (allowed range: 0..={}, max abs diff: {})",
+                        latest_id,
+                        latest_base_decimals,
+                        latest_quote_decimals,
+                        MAX_SUPPORTED_TOKEN_DECIMALS,
+                        MAX_SUPPORTED_DECIMAL_DIFFERENCE
+                    ));
+                }
+
+                return Err(MarketConfigNotFound { market_id }.into());
+            }
         };
 
         let base_decimals_i32: i32 = row.get(0);
@@ -852,6 +914,7 @@ impl MarketConfigStore {
             u8::try_from(base_decimals_i32).context("Invalid base_decimals in market_configs")?;
         let quote_decimals =
             u8::try_from(quote_decimals_i32).context("Invalid quote_decimals in market_configs")?;
+        validate_market_decimals(base_decimals, quote_decimals)?;
 
         let decimals = MarketDecimals {
             base_decimals,
@@ -899,4 +962,41 @@ fn price_scale(base_decimals: u8, quote_decimals: u8) -> f64 {
 
 fn token_scale(decimals: u8) -> f64 {
     10f64.powi(decimals as i32)
+}
+
+fn validate_market_decimals(base_decimals: u8, quote_decimals: u8) -> Result<()> {
+    if base_decimals > MAX_SUPPORTED_TOKEN_DECIMALS || quote_decimals > MAX_SUPPORTED_TOKEN_DECIMALS
+    {
+        return Err(anyhow!(
+            "Unsupported market decimals: base_decimals={}, quote_decimals={}, max_supported={}",
+            base_decimals,
+            quote_decimals,
+            MAX_SUPPORTED_TOKEN_DECIMALS
+        ));
+    }
+
+    let diff = base_decimals as i32 - quote_decimals as i32;
+    if diff.abs() > MAX_SUPPORTED_DECIMAL_DIFFERENCE {
+        return Err(anyhow!(
+            "Unsupported decimals difference: base_decimals={}, quote_decimals={}, abs_diff={} (max={})",
+            base_decimals,
+            quote_decimals,
+            diff.abs(),
+            MAX_SUPPORTED_DECIMAL_DIFFERENCE
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_valid_chart_price(value: f64) -> bool {
+    value.is_finite() && value > 0.0 && value.abs() <= MAX_LIGHTWEIGHT_CHART_ABS_VALUE
+}
+
+fn sanitize_chart_volume(value: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 && value.abs() <= MAX_LIGHTWEIGHT_CHART_ABS_VALUE {
+        value
+    } else {
+        0.0
+    }
 }
