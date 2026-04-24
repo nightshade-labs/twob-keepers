@@ -135,7 +135,7 @@ impl ApiError {
     fn internal(error: anyhow::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: error.to_string(),
+            message: format!("{error:#}"),
         }
     }
 }
@@ -494,7 +494,7 @@ async fn get_candles(
             GROUP BY bucket_start \
         ) \
         SELECT \
-            toUInt64(intDiv(toUnixTimestamp64Milli(bucket_time), 1000)) AS time, \
+            toUInt64(toUnixTimestamp(bucket_time)) AS time, \
             min(start_slot) AS start_slot, \
             max(end_slot) AS end_slot, \
             argMin(open_price, bucket_start) * ? AS open, \
