@@ -38,6 +38,8 @@ const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
 const DEFAULT_HISTORY_MAX_ROWS: usize = 25_000;
 const ABSOLUTE_MAX_HISTORY_ROWS: usize = 200_000;
+const DEFAULT_CLOSED_POSITION_MINI_CHART_POINTS: usize = 240;
+const ABSOLUTE_MAX_CLOSED_POSITION_MINI_CHART_POINTS: usize = 2_000;
 const DEFAULT_UPDATES_LIMIT: usize = 200;
 const ABSOLUTE_MAX_UPDATES_LIMIT: usize = 5000;
 const DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS: u64 = 300;
@@ -202,6 +204,13 @@ struct MarketUpdatesQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct ClosedPositionMiniChartQuery {
+    start_slot: u64,
+    end_slot: u64,
+    max_points: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct CandleResponse {
     market_id: u64,
@@ -256,6 +265,21 @@ struct MarketUpdatesResponse {
 }
 
 #[derive(Serialize)]
+struct ClosedPositionMiniChartResponse {
+    market_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    points: usize,
+    items: Vec<ClosedPositionMiniChartItem>,
+}
+
+#[derive(Serialize)]
+struct ClosedPositionMiniChartItem {
+    slot: u64,
+    price: f64,
+}
+
+#[derive(Serialize)]
 struct MarketHistoryItem {
     event_uid: String,
     signature: String,
@@ -277,6 +301,12 @@ struct MarketHistoryRow {
     base_flow: u64,
     quote_flow: u64,
     event_time_ms: i64,
+}
+
+#[derive(Row, Deserialize)]
+struct ClosedPositionMiniChartRow {
+    slot: u64,
+    raw_price: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -412,6 +442,10 @@ async fn main() -> Result<()> {
         .route("/v1/markets/{market_id}/stream", get(stream_market_price))
         .route("/v1/markets/{market_id}/candles", get(get_candles))
         .route("/v1/markets/{market_id}/history", get(get_market_history))
+        .route(
+            "/v1/markets/{market_id}/closed-position-mini-chart",
+            get(get_closed_position_mini_chart),
+        )
         .route("/v1/markets/{market_id}/updates", get(get_market_updates))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -725,6 +759,66 @@ async fn get_market_updates(
     }))
 }
 
+async fn get_closed_position_mini_chart(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<u64>,
+    Query(query): Query<ClosedPositionMiniChartQuery>,
+) -> Result<Json<ClosedPositionMiniChartResponse>, ApiError> {
+    if query.start_slot > query.end_slot {
+        return Err(ApiError::bad_request(
+            "'start_slot' must be less than or equal to 'end_slot'",
+        ));
+    }
+
+    let max_points = query
+        .max_points
+        .unwrap_or(DEFAULT_CLOSED_POSITION_MINI_CHART_POINTS);
+    if max_points == 0 || max_points > ABSOLUTE_MAX_CLOSED_POSITION_MINI_CHART_POINTS {
+        return Err(ApiError::bad_request(format!(
+            "max_points must be between 1 and {ABSOLUTE_MAX_CLOSED_POSITION_MINI_CHART_POINTS}"
+        )));
+    }
+
+    let decimals = state
+        .market_config_store
+        .get_market_decimals(market_id)
+        .await
+        .map_err(map_market_config_error)?;
+    let price_scale = price_scale(decimals.base_decimals, decimals.quote_decimals);
+
+    let rows = query_closed_position_mini_chart_rows(
+        &state.client,
+        &state.config.market_updates_table,
+        market_id,
+        query.start_slot,
+        query.end_slot,
+        max_points,
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.context("Failed to query closed-position mini chart")))?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let price = row.raw_price * price_scale;
+        if !is_valid_chart_price(price) {
+            continue;
+        }
+
+        items.push(ClosedPositionMiniChartItem {
+            slot: row.slot,
+            price,
+        });
+    }
+
+    Ok(Json(ClosedPositionMiniChartResponse {
+        market_id,
+        start_slot: query.start_slot,
+        end_slot: query.end_slot,
+        points: items.len(),
+        items,
+    }))
+}
+
 async fn fetch_latest_price_snapshot(
     client: &Client,
     market_updates_table: &str,
@@ -914,6 +1008,85 @@ async fn query_market_updates_rows(
         .context("Failed to query market updates rows")?;
 
     Ok(rows)
+}
+
+async fn query_closed_position_mini_chart_rows(
+    client: &Client,
+    market_updates_table: &str,
+    market_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    max_points: usize,
+) -> Result<Vec<ClosedPositionMiniChartRow>> {
+    if max_points == 0 || start_slot > end_slot {
+        return Ok(Vec::new());
+    }
+
+    let slot_span = end_slot.saturating_sub(start_slot).saturating_add(1);
+    let bucket_size = ((slot_span as u128 + max_points as u128 - 1) / max_points as u128) as u64;
+    let bucket_size = bucket_size.max(1);
+
+    let anchor_sql = format!(
+        "SELECT \
+            slot, \
+            abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
+         FROM {} \
+         WHERE market_id = ? \
+           AND base_flow != 0 \
+           AND slot < ? \
+           AND NOT startsWith(event_uid, 'debug:') \
+         ORDER BY slot DESC, event_index DESC \
+         LIMIT 1",
+        market_updates_table
+    );
+
+    let mut anchor_rows = client
+        .query(&anchor_sql)
+        .bind(market_id)
+        .bind(start_slot)
+        .fetch_all::<ClosedPositionMiniChartRow>()
+        .await
+        .context("Failed to query closed-position mini chart anchor row")?;
+
+    let sampled_sql = format!(
+        "SELECT \
+            min(slot) AS slot, \
+            argMin( \
+                abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)), \
+                tuple(slot, event_index) \
+            ) AS raw_price \
+         FROM {} \
+         WHERE market_id = ? \
+           AND base_flow != 0 \
+           AND slot >= ? \
+           AND slot <= ? \
+           AND NOT startsWith(event_uid, 'debug:') \
+         GROUP BY intDiv(slot - ?, ?) \
+         ORDER BY slot ASC \
+         LIMIT ?",
+        market_updates_table
+    );
+
+    let mut sampled_rows = client
+        .query(&sampled_sql)
+        .bind(market_id)
+        .bind(start_slot)
+        .bind(end_slot)
+        .bind(start_slot)
+        .bind(bucket_size)
+        .bind(max_points as u64)
+        .fetch_all::<ClosedPositionMiniChartRow>()
+        .await
+        .context("Failed to query closed-position mini chart sampled rows")?;
+
+    if anchor_rows.is_empty() {
+        return Ok(sampled_rows);
+    }
+
+    anchor_rows.append(&mut sampled_rows);
+    anchor_rows.sort_by(|left, right| left.slot.cmp(&right.slot));
+    anchor_rows.dedup_by(|left, right| left.slot == right.slot);
+    Ok(anchor_rows)
 }
 
 fn market_history_item_from_row(row: MarketHistoryRow) -> Result<MarketHistoryItem, ApiError> {
