@@ -36,6 +36,8 @@ const DEFAULT_CANDLES_1M_TABLE: &str = "market_candles_1m";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
+const DEFAULT_HISTORY_MAX_ROWS: usize = 25_000;
+const ABSOLUTE_MAX_HISTORY_ROWS: usize = 200_000;
 const DEFAULT_MARKET_CONFIG_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_PRICE_STREAM_POLL_MS: u64 = 1000;
 const MAX_SUPPORTED_TOKEN_DECIMALS: u8 = 18;
@@ -185,6 +187,13 @@ struct CandleQuery {
     max_points: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct MarketHistoryQuery {
+    start_slot: u64,
+    end_slot: u64,
+    max_rows: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct CandleResponse {
     market_id: u64,
@@ -217,6 +226,39 @@ struct CandleRow {
     low: f64,
     close: f64,
     volume: f64,
+}
+
+#[derive(Serialize)]
+struct MarketHistoryResponse {
+    market_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    points: usize,
+    items: Vec<MarketHistoryItem>,
+}
+
+#[derive(Serialize)]
+struct MarketHistoryItem {
+    event_uid: String,
+    signature: String,
+    event_index: u16,
+    slot: u64,
+    market_id: u64,
+    base_flow: String,
+    quote_flow: String,
+    created_at: String,
+}
+
+#[derive(Row, Deserialize)]
+struct MarketHistoryRow {
+    event_uid: String,
+    signature: String,
+    event_index: u16,
+    slot: u64,
+    market_id: u64,
+    base_flow: u64,
+    quote_flow: u64,
+    event_time_ms: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +393,7 @@ async fn main() -> Result<()> {
         .route("/v1/markets/{market_id}/price", get(get_latest_price))
         .route("/v1/markets/{market_id}/stream", get(stream_market_price))
         .route("/v1/markets/{market_id}/candles", get(get_candles))
+        .route("/v1/markets/{market_id}/history", get(get_market_history))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -578,6 +621,66 @@ async fn get_candles(
     }))
 }
 
+async fn get_market_history(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<u64>,
+    Query(query): Query<MarketHistoryQuery>,
+) -> Result<Json<MarketHistoryResponse>, ApiError> {
+    if query.start_slot > query.end_slot {
+        return Err(ApiError::bad_request(
+            "'start_slot' must be less than or equal to 'end_slot'",
+        ));
+    }
+
+    let max_rows = query.max_rows.unwrap_or(DEFAULT_HISTORY_MAX_ROWS);
+    if max_rows == 0 || max_rows > ABSOLUTE_MAX_HISTORY_ROWS {
+        return Err(ApiError::bad_request(format!(
+            "max_rows must be between 1 and {ABSOLUTE_MAX_HISTORY_ROWS}"
+        )));
+    }
+
+    let rows = query_market_history_rows(
+        &state.client,
+        &state.config.market_updates_table,
+        market_id,
+        query.start_slot,
+        query.end_slot,
+        max_rows,
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.context("Failed to query market history")))?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let created_at = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
+            ApiError::internal(anyhow!(
+                "Invalid event_time_ms {} for event_uid={}",
+                row.event_time_ms,
+                row.event_uid
+            ))
+        })?;
+
+        items.push(MarketHistoryItem {
+            event_uid: row.event_uid,
+            signature: row.signature,
+            event_index: row.event_index,
+            slot: row.slot,
+            market_id: row.market_id,
+            base_flow: row.base_flow.to_string(),
+            quote_flow: row.quote_flow.to_string(),
+            created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        });
+    }
+
+    Ok(Json(MarketHistoryResponse {
+        market_id,
+        start_slot: query.start_slot,
+        end_slot: query.end_slot,
+        points: items.len(),
+        items,
+    }))
+}
+
 async fn fetch_latest_price_snapshot(
     client: &Client,
     market_updates_table: &str,
@@ -620,6 +723,106 @@ async fn query_latest_price_row(
         .context("Failed to query latest price")?;
 
     Ok(rows.into_iter().next())
+}
+
+async fn query_market_history_rows(
+    client: &Client,
+    market_updates_table: &str,
+    market_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    max_rows: usize,
+) -> Result<Vec<MarketHistoryRow>> {
+    if max_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let anchor_sql = format!(
+        "SELECT \
+            event_uid, \
+            signature, \
+            event_index, \
+            slot, \
+            market_id, \
+            base_flow, \
+            quote_flow, \
+            toUnixTimestamp64Milli(event_time) AS event_time_ms \
+         FROM {} \
+         WHERE market_id = ? \
+           AND slot < ? \
+           AND NOT startsWith(event_uid, 'debug:') \
+         ORDER BY slot DESC, event_index DESC \
+         LIMIT 1",
+        market_updates_table
+    );
+
+    let mut anchor_rows = client
+        .query(&anchor_sql)
+        .bind(market_id)
+        .bind(start_slot)
+        .fetch_all::<MarketHistoryRow>()
+        .await
+        .context("Failed to query market history anchor row")?;
+
+    let remaining_capacity = max_rows.saturating_sub(anchor_rows.len());
+    if remaining_capacity == 0 {
+        anchor_rows.sort_by(|left, right| {
+            left.slot
+                .cmp(&right.slot)
+                .then(left.event_index.cmp(&right.event_index))
+        });
+        return Ok(anchor_rows);
+    }
+
+    let range_sql = format!(
+        "SELECT \
+            event_uid, \
+            signature, \
+            event_index, \
+            slot, \
+            market_id, \
+            base_flow, \
+            quote_flow, \
+            toUnixTimestamp64Milli(event_time) AS event_time_ms \
+         FROM {} \
+         WHERE market_id = ? \
+           AND slot >= ? \
+           AND slot <= ? \
+           AND NOT startsWith(event_uid, 'debug:') \
+         ORDER BY slot ASC, event_index ASC \
+         LIMIT ?",
+        market_updates_table
+    );
+
+    let mut range_rows = client
+        .query(&range_sql)
+        .bind(market_id)
+        .bind(start_slot)
+        .bind(end_slot)
+        .bind(remaining_capacity.saturating_add(1) as u64)
+        .fetch_all::<MarketHistoryRow>()
+        .await
+        .context("Failed to query market history range rows")?;
+
+    if range_rows.len() > remaining_capacity {
+        return Err(anyhow!(
+            "Requested history range for market_id={} exceeds max_rows={} rows",
+            market_id,
+            max_rows
+        ));
+    }
+
+    if anchor_rows.is_empty() {
+        return Ok(range_rows);
+    }
+
+    anchor_rows.append(&mut range_rows);
+    anchor_rows.sort_by(|left, right| {
+        left.slot
+            .cmp(&right.slot)
+            .then(left.event_index.cmp(&right.event_index))
+    });
+    Ok(anchor_rows)
 }
 
 fn latest_price_response_from_row(
