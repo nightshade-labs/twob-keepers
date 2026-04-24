@@ -604,7 +604,9 @@ async fn query_latest_price_row(
             toUnixTimestamp64Milli(event_time) AS event_time_ms, \
             abs(toFloat64(quote_flow)) / abs(toFloat64(base_flow)) AS raw_price \
          FROM {} \
-         WHERE market_id = ? AND base_flow != 0 \
+         WHERE market_id = ? \
+           AND base_flow != 0 \
+           AND NOT startsWith(event_uid, 'debug:') \
          ORDER BY slot DESC, event_index DESC \
          LIMIT 1",
         market_updates_table

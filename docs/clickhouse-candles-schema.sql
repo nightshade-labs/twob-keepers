@@ -41,4 +41,5 @@ SELECT
     countState() AS points_state
 FROM mato.raw_market_update_events
 WHERE base_flow != 0
+  AND NOT startsWith(event_uid, 'debug:')
 GROUP BY market_id, bucket_start;
