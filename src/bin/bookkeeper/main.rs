@@ -88,12 +88,24 @@ async fn main() -> anyhow::Result<()> {
                 .instructions()?
                 .remove(0);
 
-            program
-                .request()
-                .instruction(bookkeeping_ix)
-                .signer(payer)
-                .send()
-                .await?;
+            let mut attempts = 0u32;
+            loop {
+                match program
+                    .request()
+                    .instruction(bookkeeping_ix.clone())
+                    .signer(payer.clone())
+                    .send()
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(e) if attempts < 5 => {
+                        eprintln!("Send failed (attempt {}): {e}", attempts + 1);
+                        attempts += 1;
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         } else {
             let duration_ms = (last_update_slot + slots_between_updates - current_slot)
                 * estimated_slot_duration_ms;
