@@ -24,4 +24,4 @@ pub fn program_id() -> anchor_lang::prelude::Pubkey {
     TWOB_PROGRAM_ID.parse().expect("Invalid program ID")
 }
 
-pub const ARRAY_LENGTH: u64 = 20;
+pub const ARRAY_LENGTH: u64 = 10;
