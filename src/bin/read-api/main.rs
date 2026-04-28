@@ -173,6 +173,8 @@ struct LatestPriceResponse {
     market_id: u64,
     slot: u64,
     event_time: String,
+    #[serde(skip_serializing)]
+    event_time_ms: i64,
     price: f64,
 }
 
@@ -478,8 +480,9 @@ async fn get_latest_price(
     .await
     .map_err(map_latest_price_error)?;
 
-    let snapshot = maybe_snapshot
-        .ok_or_else(|| ApiError::not_found(format!("No market updates found for market_id={market_id}")))?;
+    let snapshot = maybe_snapshot.ok_or_else(|| {
+        ApiError::not_found(format!("No market updates found for market_id={market_id}"))
+    })?;
 
     Ok(Json(snapshot))
 }
@@ -501,10 +504,7 @@ async fn stream_market_price(
         loop {
             match receiver.recv().await {
                 Ok(snapshot) => {
-                    let event = match Event::default()
-                        .event("price_update")
-                        .json_data(&snapshot)
-                    {
+                    let event = match Event::default().event("price_update").json_data(&snapshot) {
                         Ok(event) => event,
                         Err(error) => {
                             eprintln!(
@@ -795,7 +795,9 @@ async fn get_closed_position_mini_chart(
         max_points,
     )
     .await
-    .map_err(|error| ApiError::internal(error.context("Failed to query closed-position mini chart")))?;
+    .map_err(|error| {
+        ApiError::internal(error.context("Failed to query closed-position mini chart"))
+    })?;
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
@@ -848,7 +850,7 @@ async fn query_latest_price_row(
          WHERE market_id = ? \
            AND base_flow != 0 \
            AND NOT startsWith(event_uid, 'debug:') \
-         ORDER BY slot DESC, event_index DESC \
+         ORDER BY event_time DESC, slot DESC, event_index DESC \
          LIMIT 1",
         market_updates_table
     );
@@ -994,7 +996,7 @@ async fn query_market_updates_rows(
         sql.push_str(" AND slot < ?");
     }
 
-    sql.push_str(" ORDER BY slot DESC, event_index DESC LIMIT ?");
+    sql.push_str(" ORDER BY event_time DESC, slot DESC, event_index DESC LIMIT ?");
 
     let mut query = client.query(&sql).bind(market_id);
     if let Some(before_slot) = before_slot {
@@ -1090,13 +1092,14 @@ async fn query_closed_position_mini_chart_rows(
 }
 
 fn market_history_item_from_row(row: MarketHistoryRow) -> Result<MarketHistoryItem, ApiError> {
-    let created_at = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
-        ApiError::internal(anyhow!(
-            "Invalid event_time_ms {} for event_uid={}",
-            row.event_time_ms,
-            row.event_uid
-        ))
-    })?;
+    let created_at =
+        DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
+            ApiError::internal(anyhow!(
+                "Invalid event_time_ms {} for event_uid={}",
+                row.event_time_ms,
+                row.event_uid
+            ))
+        })?;
 
     Ok(MarketHistoryItem {
         event_uid: row.event_uid,
@@ -1130,6 +1133,7 @@ fn latest_price_response_from_row(
         market_id,
         slot: row.slot,
         event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_time_ms: row.event_time_ms,
         price: scaled_price,
     })
 }
@@ -1186,7 +1190,7 @@ async fn run_market_price_stream(
 ) {
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut latest_slot: Option<u64> = None;
+    let mut latest_snapshot_key: Option<(i64, u64)> = None;
 
     loop {
         match fetch_latest_price_snapshot(
@@ -1198,9 +1202,12 @@ async fn run_market_price_stream(
         .await
         {
             Ok(Some(snapshot)) => {
-                let is_newer = latest_slot.map(|slot| snapshot.slot > slot).unwrap_or(true);
+                let snapshot_key = (snapshot.event_time_ms, snapshot.slot);
+                let is_newer = latest_snapshot_key
+                    .map(|latest_key| snapshot_key > latest_key)
+                    .unwrap_or(true);
                 if is_newer {
-                    latest_slot = Some(snapshot.slot);
+                    latest_snapshot_key = Some(snapshot_key);
                     let _ = sender.send(snapshot);
                 }
             }
@@ -1377,12 +1384,13 @@ impl MarketConfigStore {
                      LIMIT 1",
                     market_id
                 );
-                let latest_rows = client
-                    .simple_query(&latest_row_sql)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to inspect latest market_configs row for market_id={market_id}")
-                    })?;
+                let latest_rows = client.simple_query(&latest_row_sql).await.with_context(
+                    || {
+                        format!(
+                            "Failed to inspect latest market_configs row for market_id={market_id}"
+                        )
+                    },
+                )?;
 
                 if let Some(latest_row) = find_first_simple_query_row(&latest_rows) {
                     let latest_id = latest_row.get(0).unwrap_or("<missing>");
