@@ -88,6 +88,31 @@ Table-name overrides (defaults shown):
 | `MARKET_UPDATES_TABLE` | `raw_market_update_events` |
 | `CANDLES_1M_TABLE` | `market_candles_1m` |
 
+## Known limitations / follow-ups
+
+**Event de-duplication is best-effort.** `event_uid`
+(`<type>:<signature>:<event_index>`) is the natural idempotency key, but
+TimescaleDB requires every unique index on a hypertable to include the
+partitioning column (`event_time`), and the keeper stamps `event_time = now()`
+per ingest. A re-delivered event therefore gets a new `event_time` and is not
+deduplicated.
+
+In practice this is low-risk: `logsSubscribe` does not replay history on
+reconnect, so a single keeper instance rarely sees duplicates, and the candle
+upsert is naturally idempotent (re-applying the same price does not move
+OHLC) — the only artifact is an occasional duplicate row in
+`raw_market_update_events` / `raw_close_position_events`, visible in `/history`
+and `/updates`.
+
+**This must be addressed before** running the keeper active-active (multiple
+replicas) or adding a historical backfill job, since both turn duplicates from
+rare into guaranteed. The simplest fix is a regular (non-hypertable)
+`processed_events(event_uid PRIMARY KEY)` table that both inserts are gated
+through; making `event_time` deterministic (on-chain `block_time`) is an
+alternative that also improves chart-time accuracy. Note that missed events
+during keeper downtime (gaps) are a separate, currently-unaddressed concern that
+idempotency does not solve.
+
 ## Running services
 
 Run the bookkeeper for one market:
