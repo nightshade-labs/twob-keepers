@@ -1,16 +1,102 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use tokio_postgres::NoTls;
 
 use crate::sink::{
     ClosePositionEventRecord, EventSink, MarketUpdateEventRecord, SinkFuture, SinkMetricsSnapshot,
 };
 
-pub struct Database {
+/// Insert the raw market-update event and, in the same statement, recompute the
+/// affected 1-minute candle.
+///
+/// Price is computed in SQL at full `numeric` precision by joining
+/// `market_configs` for the token decimals, so the keeper never needs to read
+/// values back or carry decimals in process memory.
+///
+/// Candle semantics (step-function price that persists between updates):
+/// - `open` of a freshly created bucket carries forward the previous bucket's
+///   `close` (derived from the table itself, so it is restart-safe).
+/// - `high`/`low` use `GREATEST`/`LEAST` and are order-independent.
+/// - `close` is the latest event's price (last write wins).
+///
+/// If the raw insert hits `ON CONFLICT DO NOTHING` (duplicate) or the market has
+/// no `market_configs` row, the candle CTE simply produces no row and the candle
+/// is left untouched.
+const INSERT_MARKET_UPDATE_SQL: &str = "\
+WITH ev AS ( \
+    INSERT INTO raw_market_update_events \
+        (event_uid, signature, event_index, slot, market_id, base_flow, quote_flow, event_time) \
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+    ON CONFLICT DO NOTHING \
+    RETURNING market_id, base_flow, quote_flow, event_time \
+), \
+p AS ( \
+    SELECT \
+        ev.market_id, \
+        date_trunc('minute', ev.event_time) AS bucket_start, \
+        (ev.quote_flow::numeric * power(10::numeric, mc.base_decimals::numeric)) \
+            / (ev.base_flow::numeric * power(10::numeric, mc.quote_decimals::numeric)) AS price \
+    FROM ev \
+    JOIN market_configs mc ON mc.market_id = ev.market_id \
+    WHERE ev.base_flow <> 0 \
+      AND mc.base_decimals IS NOT NULL \
+      AND mc.quote_decimals IS NOT NULL \
+) \
+INSERT INTO market_candles_1m (market_id, bucket_start, open, high, low, close, updated_at) \
+SELECT \
+    p.market_id, \
+    p.bucket_start, \
+    COALESCE( \
+        (SELECT c.close FROM market_candles_1m c \
+          WHERE c.market_id = p.market_id AND c.bucket_start < p.bucket_start \
+          ORDER BY c.bucket_start DESC LIMIT 1), \
+        p.price), \
+    p.price, p.price, p.price, now() \
+FROM p \
+ON CONFLICT (market_id, bucket_start) DO UPDATE SET \
+    high  = GREATEST(market_candles_1m.high, EXCLUDED.close), \
+    low   = LEAST(market_candles_1m.low,  EXCLUDED.close), \
+    close = EXCLUDED.close, \
+    updated_at = now()";
+
+const INSERT_CLOSE_POSITION_SQL: &str = "\
+INSERT INTO raw_close_position_events \
+    (event_uid, signature, event_index, slot, position_authority, market_id, start_slot, \
+     end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, event_time) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+ON CONFLICT DO NOTHING";
+
+/// Build a TLS-enabled connection pool for Tiger Cloud (Timescale).
+///
+/// Tiger Cloud requires TLS, so connections go through a native-TLS connector.
+/// Use `?sslmode=require` in the connection string.
+pub fn connect_pool(database_url: &str, max_size: usize) -> Result<Pool> {
+    let config: tokio_postgres::Config = database_url
+        .parse()
+        .context("Failed to parse database URL")?;
+
+    let tls_connector = TlsConnector::builder()
+        .build()
+        .context("Failed to build native TLS connector")?;
+    let tls = MakeTlsConnector::new(tls_connector);
+
+    let manager_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let manager = Manager::from_config(config, tls, manager_config);
+    Pool::builder(manager)
+        .max_size(max_size)
+        .build()
+        .context("Failed to create connection pool")
+}
+
+pub struct TimescaleSink {
     pool: Pool,
     metrics: Arc<DatabaseMetrics>,
 }
@@ -24,28 +110,19 @@ struct DatabaseMetrics {
     last_error: Mutex<Option<String>>,
 }
 
-impl Database {
+impl TimescaleSink {
     pub async fn connect(database_url: &str) -> Result<Self> {
-        // Parse the database URL
-        let config: tokio_postgres::Config = database_url
-            .parse()
-            .context("Failed to parse database URL")?;
+        let pool = connect_pool(database_url, 16)?;
 
-        // Create deadpool config
-        let manager_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        };
-        let manager = Manager::from_config(config, NoTls, manager_config);
-        let pool = Pool::builder(manager)
-            .max_size(16)
-            .build()
-            .context("Failed to create connection pool")?;
-
-        // Test the connection
-        let _ = pool
+        // Verify the connection (and TLS handshake) eagerly.
+        let client = pool
             .get()
             .await
             .context("Failed to get connection from pool")?;
+        client
+            .simple_query("SELECT 1")
+            .await
+            .context("Failed to verify Tiger Cloud connection")?;
 
         Ok(Self {
             pool,
@@ -53,166 +130,103 @@ impl Database {
         })
     }
 
-    pub async fn insert_market_update_event(
-        &self,
-        signature: &str,
-        slot: u64,
-        market_id: u64,
-        base_flow: u64,
-        quote_flow: u64,
-    ) -> Result<()> {
+    async fn insert_market_update(&self, event: &MarketUpdateEventRecord) -> Result<()> {
         let client = self.pool.get().await.context("Failed to get connection")?;
-
-        let result = client
+        client
             .execute(
-                "INSERT INTO market_update_events (signature, slot, market_id, base_flow, quote_flow)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (signature) DO NOTHING",
+                INSERT_MARKET_UPDATE_SQL,
                 &[
-                    &signature,
-                    &(slot as i64),
-                    &(market_id as i64),
-                    &(base_flow as i64),
-                    &(quote_flow as i64),
+                    &event.event_uid(),
+                    &event.signature,
+                    &(event.event_index as i32),
+                    &(event.slot as i64),
+                    &(event.market_id as i64),
+                    &(event.base_flow as i64),
+                    &(event.quote_flow as i64),
+                    &Utc::now(),
                 ],
             )
-            .await;
-
-        match result {
-            Ok(_) => {
-                self.metrics
-                    .market_update_successes
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics
-                    .market_update_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut guard = self.metrics.last_error.lock().expect("mutex poisoned");
-                    *guard = Some(format!("market_update insert failure: {e}"));
-                }
-                eprintln!("Database error details: {:?}", e);
-                if let Some(db_err) = e.as_db_error() {
-                    eprintln!("  Code: {:?}", db_err.code());
-                    eprintln!("  Message: {}", db_err.message());
-                    eprintln!("  Detail: {:?}", db_err.detail());
-                    eprintln!("  Hint: {:?}", db_err.hint());
-                }
-                Err(anyhow::anyhow!(
-                    "Failed to insert market update event: {}",
-                    e
-                ))
-            }
-        }
+            .await
+            .context("Failed to insert market update event")?;
+        Ok(())
     }
 
-    pub async fn insert_close_position_event(
-        &self,
-        signature: &str,
-        slot: u64,
-        position_authority: &str,
-        market_id: u64,
-        start_slot: u64,
-        end_slot: u64,
-        deposit_amount: u64,
-        swapped_amount: u64,
-        remaining_amount: u64,
-        fee_amount: u64,
-        is_buy: u8,
-    ) -> Result<()> {
+    async fn insert_close_position(&self, event: &ClosePositionEventRecord) -> Result<()> {
         let client = self.pool.get().await.context("Failed to get connection")?;
-
-        let result = client
+        client
             .execute(
-                "INSERT INTO close_position_events
-                 (signature, slot, position_authority, market_id, start_slot, end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 ON CONFLICT (signature) DO NOTHING",
+                INSERT_CLOSE_POSITION_SQL,
                 &[
-                    &signature,
-                    &(slot as i64),
-                    &position_authority,
-                    &(market_id as i64),
-                    &(start_slot as i64),
-                    &(end_slot as i64),
-                    &(deposit_amount as i64),
-                    &(swapped_amount as i64),
-                    &(remaining_amount as i64),
-                    &(fee_amount as i64),
-                    &(is_buy as i16),
+                    &event.event_uid(),
+                    &event.signature,
+                    &(event.event_index as i32),
+                    &(event.slot as i64),
+                    &event.position_authority,
+                    &(event.market_id as i64),
+                    &(event.start_slot as i64),
+                    &(event.end_slot as i64),
+                    &(event.deposit_amount as i64),
+                    &(event.swapped_amount as i64),
+                    &(event.remaining_amount as i64),
+                    &(event.fee_amount as i64),
+                    &(event.is_buy != 0),
+                    &Utc::now(),
                 ],
             )
-            .await;
-
-        match result {
-            Ok(_) => {
-                self.metrics
-                    .close_position_successes
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics
-                    .close_position_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut guard = self.metrics.last_error.lock().expect("mutex poisoned");
-                    *guard = Some(format!("close_position insert failure: {e}"));
-                }
-                eprintln!("Database error details: {:?}", e);
-                if let Some(db_err) = e.as_db_error() {
-                    eprintln!("  Code: {:?}", db_err.code());
-                    eprintln!("  Message: {}", db_err.message());
-                    eprintln!("  Detail: {:?}", db_err.detail());
-                    eprintln!("  Hint: {:?}", db_err.hint());
-                }
-                Err(anyhow::anyhow!(
-                    "Failed to insert close position event: {}",
-                    e
-                ))
-            }
-        }
+            .await
+            .context("Failed to insert close position event")?;
+        Ok(())
     }
 }
 
-impl EventSink for Database {
+impl EventSink for TimescaleSink {
     fn sink_name(&self) -> &'static str {
-        "postgres"
+        "timescale"
     }
 
     fn insert_market_update_event(&self, event: MarketUpdateEventRecord) -> SinkFuture<'_> {
         Box::pin(async move {
-            Database::insert_market_update_event(
-                self,
-                &event.signature,
-                event.slot,
-                event.market_id,
-                event.base_flow,
-                event.quote_flow,
-            )
-            .await
+            match self.insert_market_update(&event).await {
+                Ok(()) => {
+                    self.metrics
+                        .market_update_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.metrics
+                        .market_update_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut guard = self.metrics.last_error.lock().expect("mutex poisoned");
+                        *guard = Some(format!("market_update insert failure: {error:#}"));
+                    }
+                    Err(error)
+                }
+            }
         })
     }
 
     fn insert_close_position_event(&self, event: ClosePositionEventRecord) -> SinkFuture<'_> {
         Box::pin(async move {
-            Database::insert_close_position_event(
-                self,
-                &event.signature,
-                event.slot,
-                &event.position_authority,
-                event.market_id,
-                event.start_slot,
-                event.end_slot,
-                event.deposit_amount,
-                event.swapped_amount,
-                event.remaining_amount,
-                event.fee_amount,
-                event.is_buy,
-            )
-            .await
+            match self.insert_close_position(&event).await {
+                Ok(()) => {
+                    self.metrics
+                        .close_position_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.metrics
+                        .close_position_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut guard = self.metrics.last_error.lock().expect("mutex poisoned");
+                        *guard = Some(format!("close_position insert failure: {error:#}"));
+                    }
+                    Err(error)
+                }
+            }
         })
     }
 

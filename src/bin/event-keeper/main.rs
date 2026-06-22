@@ -16,8 +16,8 @@ use std::{
 };
 use tokio::time::MissedTickBehavior;
 use twob_keepers::{
-    ClickHouseSink, ClickHouseSinkConfig, ClosePositionEventRecord, Database, EventSink,
-    FanoutSink, MarketUpdateEventRecord, SinkMetricsSnapshot,
+    ClosePositionEventRecord, EventSink, MarketUpdateEventRecord, SinkMetricsSnapshot,
+    TimescaleSink,
 };
 
 declare_program!(twob_anchor);
@@ -126,52 +126,14 @@ impl IngestStats {
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
 
-    let mut sinks: Vec<Arc<dyn EventSink>> = Vec::new();
-
     let database_url = env::var("DATABASE_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            env::var("DATABASE_PASSWORD").ok().map(|database_password| {
-                format!(
-                    "postgresql://postgres.xzlbpjbsuyrjoijmmtom:{}@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
-                    database_password
-                )
-            })
-        });
+        .ok_or_else(|| anyhow!("DATABASE_URL must be set (Tiger Cloud connection string)"))?;
 
-    if let Some(database_url) = database_url {
-        let postgres_sink: Arc<dyn EventSink> = Arc::new(Database::connect(&database_url).await?);
-        sinks.push(postgres_sink);
-        println!("Connected to Postgres sink");
-    } else {
-        println!("Postgres sink is disabled (set DATABASE_URL to enable)");
-    }
-
-    if let Some(clickhouse_config) = ClickHouseSinkConfig::from_env_optional()? {
-        let clickhouse_sink: Arc<dyn EventSink> =
-            Arc::new(ClickHouseSink::connect(clickhouse_config).await?);
-        sinks.push(clickhouse_sink);
-        println!("Connected to ClickHouse sink");
-    } else {
-        println!("CLICKHOUSE_URL is not set; ClickHouse sink is disabled");
-    }
-
-    if sinks.is_empty() {
-        return Err(anyhow!(
-            "No sinks configured. Set CLICKHOUSE_URL and/or DATABASE_URL"
-        ));
-    }
-
-    let sink: Arc<dyn EventSink> = if sinks.len() == 1 {
-        sinks
-            .into_iter()
-            .next()
-            .expect("sinks contains one configured sink")
-    } else {
-        Arc::new(FanoutSink::new(sinks))
-    };
+    let sink: Arc<dyn EventSink> = Arc::new(TimescaleSink::connect(&database_url).await?);
+    println!("Connected to Tiger Cloud (Timescale) sink");
 
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
     let program_id = twob_anchor::ID.to_string();

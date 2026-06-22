@@ -2,8 +2,8 @@
 //!
 //! Run with: cargo run --example accounts_usage
 
-use twob_keepers::{AccountResolver, program_id};
 use anchor_lang::prelude::Pubkey;
+use twob_keepers::{AccountResolver, program_id};
 
 fn main() {
     // Create an account resolver with the TwoB program ID
