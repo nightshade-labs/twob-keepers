@@ -483,7 +483,7 @@ async fn get_candles(
     // last candle strictly before `from` so leading gaps render as flat doji.
     let sql = format!(
         "SELECT \
-            extract(epoch from time_bucket_gapfill($4::text::interval, bucket_start))::bigint AS bucket_s, \
+            time_bucket_gapfill($4::text::interval, bucket_start) AS bucket, \
             first(open, bucket_start)  AS open, \
             max(high)                  AS high, \
             min(low)                   AS low, \
@@ -498,7 +498,7 @@ async fn get_candles(
          WHERE market_id = $1 \
            AND bucket_start >= $2 \
            AND bucket_start < $3 \
-         GROUP BY time_bucket_gapfill($4::text::interval, bucket_start) \
+         GROUP BY 1 \
          ORDER BY 1",
         state.config.candles_1m_table
     );
@@ -521,7 +521,8 @@ async fn get_candles(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let bucket_s: i64 = row.get("bucket_s");
+        let bucket: DateTime<Utc> = row.get("bucket");
+        let bucket_s = bucket.timestamp();
         let open: Option<Decimal> = row.get("open");
         let close: Option<Decimal> = row.get("close");
 
