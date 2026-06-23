@@ -27,6 +27,7 @@ use twob_keepers::database::connect_pool;
 
 const DEFAULT_MARKET_UPDATES_TABLE: &str = "raw_market_update_events";
 const DEFAULT_CANDLES_1M_TABLE: &str = "market_candles_1m";
+const DEFAULT_CLOSE_POSITION_EVENTS_TABLE: &str = "raw_close_position_events";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
@@ -54,6 +55,7 @@ struct ReadApiConfig {
     bind_addr: SocketAddr,
     market_updates_table: String,
     candles_1m_table: String,
+    close_position_events_table: String,
     price_stream_poll_interval: Duration,
 }
 
@@ -73,6 +75,10 @@ impl ReadApiConfig {
         let candles_1m_table = validate_table_name(
             &env::var("CANDLES_1M_TABLE").unwrap_or_else(|_| DEFAULT_CANDLES_1M_TABLE.to_string()),
         )?;
+        let close_position_events_table = validate_table_name(
+            &env::var("CLOSE_POSITION_EVENTS_TABLE")
+                .unwrap_or_else(|_| DEFAULT_CLOSE_POSITION_EVENTS_TABLE.to_string()),
+        )?;
         let price_stream_poll_interval = Duration::from_millis(parse_u64_env(
             "READ_API_PRICE_STREAM_POLL_MS",
             DEFAULT_PRICE_STREAM_POLL_MS,
@@ -85,6 +91,7 @@ impl ReadApiConfig {
                 bind_addr,
                 market_updates_table,
                 candles_1m_table,
+                close_position_events_table,
                 price_stream_poll_interval,
             },
             pool,
@@ -418,6 +425,7 @@ async fn main() -> Result<()> {
             .context("Failed to verify Tiger Cloud connection")?;
         ensure_table_exists(&client, &config.market_updates_table).await?;
         ensure_table_exists(&client, &config.candles_1m_table).await?;
+        ensure_table_exists(&client, &config.close_position_events_table).await?;
     }
 
     let state = Arc::new(AppState {
@@ -508,6 +516,7 @@ async fn get_closed_positions(
 
     let mut rows = query_closed_position_rows(
         &state.pool,
+        &state.config.close_position_events_table,
         &authority,
         query.market_id,
         query.before_slot,
@@ -1245,6 +1254,7 @@ async fn query_market_configs(pool: &Pool, market_id: Option<u64>) -> Result<Vec
 
 async fn query_closed_position_rows(
     pool: &Pool,
+    close_position_events_table: &str,
     authority: &str,
     market_id: Option<u64>,
     before_slot: Option<u64>,
@@ -1257,10 +1267,12 @@ async fn query_closed_position_rows(
     let limit_i64 = limit as i64;
     let client = pool.get().await.context("Failed to get DB connection")?;
 
-    const SELECT_COLUMNS: &str = "SELECT signature, event_index, slot, market_id, start_slot, \
+    let select_columns = format!(
+        "SELECT signature, event_index, slot, market_id, start_slot, \
         end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, \
         (extract(epoch from event_time) * 1000)::bigint AS event_time_ms \
-        FROM raw_close_position_events";
+        FROM {close_position_events_table}"
+    );
 
     // Bind params positionally; the optional filters shift the indexes, so build
     // the predicate list and the matching params vector together.
@@ -1283,7 +1295,7 @@ async fn query_closed_position_rows(
 
     params.push(&limit_i64);
     let sql = format!(
-        "{SELECT_COLUMNS} {predicates} \
+        "{select_columns} {predicates} \
          ORDER BY event_time DESC, slot DESC, event_index DESC \
          LIMIT ${}",
         params.len()
