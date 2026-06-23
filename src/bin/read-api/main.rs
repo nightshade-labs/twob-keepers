@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -37,6 +37,8 @@ const ABSOLUTE_MAX_CLOSED_POSITION_MINI_CHART_POINTS: usize = 2_000;
 const DEFAULT_UPDATES_LIMIT: usize = 200;
 const ABSOLUTE_MAX_UPDATES_LIMIT: usize = 5000;
 const DEFAULT_PRICE_STREAM_POLL_MS: u64 = 1000;
+/// Market configs change extremely rarely, so allow clients/CDNs to cache them.
+const MARKET_CONFIG_CACHE_CONTROL: &str = "public, max-age=300, stale-while-revalidate=60";
 const POOL_MAX_SIZE: usize = 16;
 const MAX_LIGHTWEIGHT_CHART_ABS_VALUE: f64 = 90_071_992_547_409.91;
 
@@ -232,6 +234,72 @@ struct ClosedPositionMiniChartItem {
     price: Decimal,
 }
 
+#[derive(Clone, Serialize)]
+struct MarketConfig {
+    market_id: u64,
+    base_mint: Option<String>,
+    quote_mint: Option<String>,
+    base_decimals: Option<i16>,
+    quote_decimals: Option<i16>,
+    base_ticker: Option<String>,
+    quote_ticker: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MarketConfigListResponse {
+    points: usize,
+    items: Vec<MarketConfig>,
+}
+
+#[derive(Deserialize)]
+struct ClosedPositionsQuery {
+    market_id: Option<u64>,
+    before_slot: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ClosedPositionsResponse {
+    authority: String,
+    market_id: Option<u64>,
+    before_slot: Option<u64>,
+    has_more: bool,
+    limit: usize,
+    points: usize,
+    items: Vec<ClosedPositionItem>,
+}
+
+#[derive(Serialize)]
+struct ClosedPositionItem {
+    signature: String,
+    event_index: u16,
+    slot: u64,
+    market_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    deposit_amount: String,
+    swapped_amount: String,
+    remaining_amount: String,
+    fee_amount: String,
+    is_buy: bool,
+    event_time: String,
+}
+
+struct ClosedPositionRow {
+    signature: String,
+    event_index: i32,
+    slot: i64,
+    market_id: i64,
+    start_slot: i64,
+    end_slot: i64,
+    deposit_amount: i64,
+    swapped_amount: i64,
+    remaining_amount: i64,
+    fee_amount: i64,
+    is_buy: bool,
+    event_time_ms: i64,
+}
+
 #[derive(Serialize)]
 struct MarketHistoryItem {
     event_uid: String,
@@ -360,6 +428,12 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/markets", get(list_market_configs))
+        .route("/v1/markets/{market_id}/config", get(get_market_config))
+        .route(
+            "/v1/authorities/{authority}/closed-positions",
+            get(get_closed_positions),
+        )
         .route("/v1/markets/{market_id}/price", get(get_latest_price))
         .route("/v1/markets/{market_id}/stream", get(stream_market_price))
         .route("/v1/markets/{market_id}/candles", get(get_candles))
@@ -385,6 +459,82 @@ async fn main() -> Result<()> {
 
 async fn healthz() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+async fn list_market_configs(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let items = query_market_configs(&state.pool, None)
+        .await
+        .map_err(|error| ApiError::internal(error.context("Failed to query market configs")))?;
+
+    Ok((
+        [(header::CACHE_CONTROL, MARKET_CONFIG_CACHE_CONTROL)],
+        Json(MarketConfigListResponse {
+            points: items.len(),
+            items,
+        }),
+    ))
+}
+
+async fn get_market_config(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<u64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let config = query_market_configs(&state.pool, Some(market_id))
+        .await
+        .map_err(|error| ApiError::internal(error.context("Failed to query market config")))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::not_found(format!("No config for market_id={market_id}")))?;
+
+    Ok((
+        [(header::CACHE_CONTROL, MARKET_CONFIG_CACHE_CONTROL)],
+        Json(config),
+    ))
+}
+
+async fn get_closed_positions(
+    State(state): State<Arc<AppState>>,
+    Path(authority): Path<String>,
+    Query(query): Query<ClosedPositionsQuery>,
+) -> Result<Json<ClosedPositionsResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_UPDATES_LIMIT);
+    if limit == 0 || limit > ABSOLUTE_MAX_UPDATES_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {ABSOLUTE_MAX_UPDATES_LIMIT}"
+        )));
+    }
+
+    let mut rows = query_closed_position_rows(
+        &state.pool,
+        &authority,
+        query.market_id,
+        query.before_slot,
+        limit.saturating_add(1),
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.context("Failed to query closed positions")))?;
+
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
+    }
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        items.push(closed_position_item_from_row(row)?);
+    }
+
+    Ok(Json(ClosedPositionsResponse {
+        authority,
+        market_id: query.market_id,
+        before_slot: query.before_slot,
+        has_more,
+        limit,
+        points: items.len(),
+        items,
+    }))
 }
 
 async fn get_latest_price(
@@ -1049,6 +1199,150 @@ fn market_history_item_from_row(row: MarketHistoryRow) -> Result<MarketHistoryIt
         base_flow: row.base_flow.to_string(),
         quote_flow: row.quote_flow.to_string(),
         created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+async fn query_market_configs(pool: &Pool, market_id: Option<u64>) -> Result<Vec<MarketConfig>> {
+    const SELECT_COLUMNS: &str = "SELECT market_id, base_mint, quote_mint, base_decimals, \
+        quote_decimals, base_ticker, quote_ticker FROM market_configs";
+
+    let client = pool.get().await.context("Failed to get DB connection")?;
+
+    let pg_rows = match market_id {
+        Some(market_id) => {
+            let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
+            let sql = format!("{SELECT_COLUMNS} WHERE market_id = $1");
+            client
+                .query(&sql, &[&market_id_i64])
+                .await
+                .context("Failed to query market config")?
+        }
+        None => {
+            let sql = format!("{SELECT_COLUMNS} ORDER BY market_id ASC");
+            client
+                .query(&sql, &[])
+                .await
+                .context("Failed to query market configs")?
+        }
+    };
+
+    pg_rows
+        .iter()
+        .map(|row| {
+            let market_id: i64 = row.get("market_id");
+            Ok(MarketConfig {
+                market_id: u64::try_from(market_id).context("market_id out of range")?,
+                base_mint: row.get("base_mint"),
+                quote_mint: row.get("quote_mint"),
+                base_decimals: row.get("base_decimals"),
+                quote_decimals: row.get("quote_decimals"),
+                base_ticker: row.get("base_ticker"),
+                quote_ticker: row.get("quote_ticker"),
+            })
+        })
+        .collect()
+}
+
+async fn query_closed_position_rows(
+    pool: &Pool,
+    authority: &str,
+    market_id: Option<u64>,
+    before_slot: Option<u64>,
+    limit: usize,
+) -> Result<Vec<ClosedPositionRow>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = limit as i64;
+    let client = pool.get().await.context("Failed to get DB connection")?;
+
+    const SELECT_COLUMNS: &str = "SELECT signature, event_index, slot, market_id, start_slot, \
+        end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, \
+        (extract(epoch from event_time) * 1000)::bigint AS event_time_ms \
+        FROM raw_close_position_events";
+
+    // Bind params positionally; the optional filters shift the indexes, so build
+    // the predicate list and the matching params vector together.
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&authority];
+    let mut predicates = String::from("WHERE position_authority = $1");
+
+    let market_id_i64;
+    if let Some(market_id) = market_id {
+        market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
+        params.push(&market_id_i64);
+        predicates.push_str(&format!(" AND market_id = ${}", params.len()));
+    }
+
+    let before_slot_i64;
+    if let Some(before_slot) = before_slot {
+        before_slot_i64 = i64::try_from(before_slot).context("before_slot out of range")?;
+        params.push(&before_slot_i64);
+        predicates.push_str(&format!(" AND slot < ${}", params.len()));
+    }
+
+    params.push(&limit_i64);
+    let sql = format!(
+        "{SELECT_COLUMNS} {predicates} \
+         ORDER BY event_time DESC, slot DESC, event_index DESC \
+         LIMIT ${}",
+        params.len()
+    );
+
+    let pg_rows = client
+        .query(&sql, &params)
+        .await
+        .context("Failed to query closed position rows")?;
+
+    Ok(pg_rows
+        .iter()
+        .map(|row| ClosedPositionRow {
+            signature: row.get("signature"),
+            event_index: row.get("event_index"),
+            slot: row.get("slot"),
+            market_id: row.get("market_id"),
+            start_slot: row.get("start_slot"),
+            end_slot: row.get("end_slot"),
+            deposit_amount: row.get("deposit_amount"),
+            swapped_amount: row.get("swapped_amount"),
+            remaining_amount: row.get("remaining_amount"),
+            fee_amount: row.get("fee_amount"),
+            is_buy: row.get("is_buy"),
+            event_time_ms: row.get("event_time_ms"),
+        })
+        .collect())
+}
+
+fn closed_position_item_from_row(row: ClosedPositionRow) -> Result<ClosedPositionItem, ApiError> {
+    let event_time = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
+        ApiError::internal(anyhow!(
+            "Invalid event_time_ms {} for signature={}",
+            row.event_time_ms,
+            row.signature
+        ))
+    })?;
+
+    let event_index = u16::try_from(row.event_index).map_err(|_| {
+        ApiError::internal(anyhow!(
+            "Invalid event_index {} for signature={}",
+            row.event_index,
+            row.signature
+        ))
+    })?;
+
+    Ok(ClosedPositionItem {
+        signature: row.signature,
+        event_index,
+        slot: row.slot.max(0) as u64,
+        market_id: row.market_id.max(0) as u64,
+        start_slot: row.start_slot.max(0) as u64,
+        end_slot: row.end_slot.max(0) as u64,
+        deposit_amount: row.deposit_amount.to_string(),
+        swapped_amount: row.swapped_amount.to_string(),
+        remaining_amount: row.remaining_amount.to_string(),
+        fee_amount: row.fee_amount.to_string(),
+        is_buy: row.is_buy,
+        event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
     })
 }
 

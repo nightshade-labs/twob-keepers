@@ -11,7 +11,7 @@ read API for market data consumers.
 | --- | --- |
 | `bookkeeper` | Periodically checks a market's bookkeeping account and sends `update_books` when the configured slot interval has elapsed. |
 | `event-keeper` | Subscribes to Solana transaction logs, decodes TwoB Anchor events, and writes market updates and close-position events to Tiger Cloud (TimescaleDB), recomputing 1-minute candles on every market update. |
-| `read-api` | Serves HTTP endpoints for latest price, price streams, candles, market history, recent updates, and closed-position mini charts. |
+| `read-api` | Serves HTTP endpoints for market configs, latest price, price streams, candles, market history, recent updates, closed-position mini charts, and per-wallet closed positions. |
 | `trade-keeper` | Experimental keeper for publicly closing expired trade positions. It currently contains hard-coded defaults and should be reviewed before production use. |
 | `liquidity-keeper` | Placeholder binary. |
 
@@ -143,14 +143,28 @@ Available endpoints:
 | Method | Path |
 | --- | --- |
 | `GET` | `/healthz` |
+| `GET` | `/v1/markets` |
+| `GET` | `/v1/markets/{market_id}/config` |
 | `GET` | `/v1/markets/{market_id}/price` |
 | `GET` | `/v1/markets/{market_id}/stream` |
 | `GET` | `/v1/markets/{market_id}/candles?from=...&to=...&interval=1m` |
 | `GET` | `/v1/markets/{market_id}/history?start_slot=...&end_slot=...` |
 | `GET` | `/v1/markets/{market_id}/updates` |
 | `GET` | `/v1/markets/{market_id}/closed-position-mini-chart?start_slot=...&end_slot=...` |
+| `GET` | `/v1/authorities/{authority}/closed-positions?market_id=...&before_slot=...&limit=...` |
 
 Supported candle intervals are `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`.
+
+`/v1/markets` lists every market config (token mints, decimals, tickers) and
+`/v1/markets/{market_id}/config` returns a single one. Both send
+`Cache-Control: public, max-age=300, stale-while-revalidate=60` since configs
+change very rarely.
+
+`/v1/authorities/{authority}/closed-positions` returns a wallet's closed
+positions newest-first. It pages with `before_slot`/`limit` (keyset, like
+`/updates`, max `limit` 5000) and returns `has_more`; `market_id` optionally
+filters to one market. Amounts are raw on-chain integers — scale them with the
+token decimals from the market-config endpoints.
 
 ## Docker
 
