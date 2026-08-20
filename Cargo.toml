@@ -2,6 +2,7 @@
 name = "twob-keepers"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 anchor-client = { version = "0.32.1", features = ["async"] }

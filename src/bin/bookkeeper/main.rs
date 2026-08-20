@@ -750,7 +750,7 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
                     "sendTransaction returned unexpected signature {returned_signature}; expected {signature}"
                 ));
             }
-            Ok(_) if broadcast_attempts == 1 || broadcast_attempts.is_multiple_of(10) => {
+            Ok(_) if broadcast_attempts == 1 || broadcast_attempts % 10 == 0 => {
                 println!(
                     "Broadcast update_books signature={} attempt={}",
                     signature, broadcast_attempts
