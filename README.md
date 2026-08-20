@@ -54,6 +54,31 @@ SLOTS_BETWEEN_UPDATES=100
 
 `PAYER_KEYPAIR` is expected to be a JSON array of keypair bytes.
 
+Run exactly one active `bookkeeper` replica per market. The process signs each
+update once, logs its signature immediately, and rebroadcasts that same signed
+transaction every 1.5 seconds until it is confirmed or its blockhash expires.
+Only an expired blockhash causes a newly signed transaction. The keeper also
+estimates a localized priority fee from the update's writable accounts and
+simulates the instruction to apply a tight compute-unit limit.
+
+Optional transaction tuning variables (defaults shown):
+
+```bash
+BOOKKEEPER_REBROADCAST_INTERVAL_MS=1500
+BOOKKEEPER_SEND_RETRY_ATTEMPTS=8       # maximum blockhash lifetimes
+BOOKKEEPER_PRIORITY_FEE_PERCENTILE=75
+BOOKKEEPER_PRIORITY_FEE_MIN_MICRO_LAMPORTS=10000
+BOOKKEEPER_PRIORITY_FEE_MAX_MICRO_LAMPORTS=1000000
+BOOKKEEPER_COMPUTE_UNIT_LIMIT=40000    # fallback if simulation RPC fails
+BOOKKEEPER_COMPUTE_UNIT_MIN=30000
+BOOKKEEPER_COMPUTE_UNIT_MAX=100000
+BOOKKEEPER_COMPUTE_UNIT_MARGIN_BPS=12000
+```
+
+Route `BOOKKEEPER_STALENESS_WARNING` and `BOOKKEEPER_CRITICAL` log lines to
+alerts. They report slot lag, remaining slots before the one-array freshness
+boundary, and confirmed transactions that did not produce the expected state.
+
 `event-keeper` requires `DATABASE_URL` pointing at Tiger Cloud:
 
 ```bash
