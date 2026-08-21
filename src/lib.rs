@@ -15,11 +15,11 @@ pub use sink::{
 };
 
 /// The TwoB Anchor program ID
-pub const TWOB_PROGRAM_ID: &str = "twobmF9NrRYUA6AN1yTdnWYfEpCr9UXWpESTRPG1KJj";
+pub const TWOB_PROGRAM_ID: &str = "CCAd78ZgUBAFNQmCCD5z4oGuFzb8uXLw5kfnBcRvDw16";
 
 /// Parse the program ID from the constant string
 pub fn program_id() -> anchor_lang::prelude::Pubkey {
     TWOB_PROGRAM_ID.parse().expect("Invalid program ID")
 }
 
-pub const ARRAY_LENGTH: u64 = 10;
+pub const ARRAY_LENGTH: u64 = 20;

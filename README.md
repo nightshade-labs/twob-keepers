@@ -12,7 +12,7 @@ read API for market data consumers.
 | `bookkeeper` | Periodically checks a market's bookkeeping account and sends `update_books` when the configured slot interval has elapsed. |
 | `event-keeper` | Subscribes to Solana transaction logs, decodes TwoB Anchor events, and writes market updates and close-position events to Tiger Cloud (TimescaleDB), recomputing 1-minute candles on every market update. |
 | `read-api` | Serves HTTP endpoints for market configs, latest price, price streams, candles, market history, recent updates, closed-position mini charts, and per-wallet closed positions. |
-| `trade-keeper` | Experimental keeper for publicly closing expired trade positions. It currently contains hard-coded defaults and should be reviewed before production use. |
+| `trade-keeper` | Publicly closes expired trade positions for one market, including legacy SPL Token, Token-2022, and abandoned paused positions. |
 | `liquidity-keeper` | Placeholder binary. |
 
 The shared library exports PDA resolution helpers, event sink abstractions, and
@@ -44,11 +44,16 @@ CLUSTER_WS_URL=wss://...
 DATABASE_URL=postgres://tsdbadmin:<password>@<host>.tsdb.cloud.timescale.com:5432/tsdb?sslmode=require
 ```
 
-`bookkeeper` also requires:
+Transaction-sending keepers (`bookkeeper` and `trade-keeper`) also require:
 
 ```bash
 PAYER_KEYPAIR=[...]
 MARKET_ID=1
+```
+
+`bookkeeper` additionally requires:
+
+```bash
 SLOTS_BETWEEN_UPDATES=100
 ```
 
@@ -145,6 +150,17 @@ Run the bookkeeper for one market:
 ```bash
 cargo run --bin bookkeeper
 ```
+
+Run the public trade-position closer for one market:
+
+```bash
+cargo run --bin trade-keeper
+```
+
+The trade keeper reads each mint's owner to select legacy SPL Token or Token-2022,
+filters positions by `MARKET_ID`, and only submits a public close after validating
+the required receiver and interval accounts. Run one active trade-keeper replica
+per market to avoid duplicate close attempts.
 
 Run the event ingester:
 

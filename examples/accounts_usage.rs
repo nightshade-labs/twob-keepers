@@ -21,7 +21,7 @@ fn main() {
     println!();
 
     // Example 2: Derive market PDA
-    let market_id = 1u64;
+    let market_id = 1u32;
     let market = resolver.market_pda(market_id);
     println!("Market PDA (id={}):", market_id);
     println!("  Address: {}", market.address());
@@ -45,7 +45,7 @@ fn main() {
     println!();
 
     // Example 5: Derive trade position PDA
-    let position_id = 1u64;
+    let position_id = 1u32;
     let trade_position = resolver.trade_position_pda(&market.address(), &authority, position_id);
     println!("Trade Position PDA (id={}):", position_id);
     println!("  Authority: {}", authority);
@@ -70,18 +70,30 @@ fn main() {
 
     // Example 8: Derive associated token account
     let mint = Pubkey::new_unique();
-    let ata = resolver.associated_token_account(&authority, &mint);
-    println!("Associated Token Account:");
+    let legacy_ata = resolver.associated_token_account(&authority, &mint);
+    let token_2022_ata = resolver.associated_token_account_with_program_id(
+        &authority,
+        &mint,
+        &anchor_spl::token_2022::ID,
+    );
+    println!("Associated Token Accounts:");
     println!("  Authority: {}", authority);
     println!("  Mint: {}", mint);
-    println!("  ATA: {}", ata);
+    println!("  Legacy SPL Token ATA: {}", legacy_ata);
+    println!("  Token-2022 ATA: {}", token_2022_ata);
     println!();
 
     // Example 9: Derive market vault (ATA owned by market)
     let base_mint = Pubkey::new_unique();
-    let vault = resolver.market_vault(&market.address(), &base_mint);
-    println!("Market Vault:");
+    let legacy_vault = resolver.market_vault(&market.address(), &base_mint);
+    let token_2022_vault = resolver.market_vault_with_program_id(
+        &market.address(),
+        &base_mint,
+        &anchor_spl::token_2022::ID,
+    );
+    println!("Market Vaults:");
     println!("  Market: {}", market.address());
     println!("  Mint: {}", base_mint);
-    println!("  Vault: {}", vault);
+    println!("  Legacy SPL Token vault: {}", legacy_vault);
+    println!("  Token-2022 vault: {}", token_2022_vault);
 }

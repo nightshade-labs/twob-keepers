@@ -157,10 +157,10 @@ async fn main() -> Result<()> {
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
     let url = Cluster::Custom(rpc_url, ws_url);
 
-    let market_id: u64 = env::var("MARKET_ID")
+    let market_id: u32 = env::var("MARKET_ID")
         .expect("MARKET_ID must be set")
         .parse()
-        .expect("MARKET_ID must be a valid u64");
+        .expect("MARKET_ID must be a valid u32");
     let config = BookkeeperConfig::from_env()?;
 
     let payer = Arc::new(payer);
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
                 .context("failed to fetch market account")
         })
         .await;
-    let end_slot_interval = market_account.end_slot_interval;
+    let end_slot_interval = u64::from(market_account.end_slot_interval);
     if end_slot_interval == 0 {
         return Err(anyhow!("market end_slot_interval must be greater than 0"));
     }
@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
                     next_update_slot, current_slot, last_update_slot
                 );
                 let reference_slot = next_update_slot;
-                let reference_index = reference_slot / end_slot_interval / ARRAY_LENGTH;
+                let reference_index = reference_index_for_slot(reference_slot, end_slot_interval);
                 let previous_index = reference_index.checked_sub(1).with_context(|| {
                     format!(
                         "reference_index is 0 for reference_slot={reference_slot}; cannot derive previous accounts yet"
@@ -772,6 +772,11 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
     }
 }
 
+fn reference_index_for_slot(slot: u64, end_slot_interval: u64) -> u64 {
+    // Index zero is reserved because every update also supplies reference_index - 1.
+    (slot / end_slot_interval / ARRAY_LENGTH).max(1)
+}
+
 fn log_book_staleness(current_slot: u64, last_update_slot: u64, end_slot_interval: u64) {
     let stale_slots = current_slot.saturating_sub(last_update_slot);
     let freshness_boundary_slots = end_slot_interval.saturating_mul(ARRAY_LENGTH);
@@ -1031,5 +1036,16 @@ mod tests {
         assert_eq!(compute_unit_limit(24_000, config), 30_000);
         assert_eq!(compute_unit_limit(40_000, config), 48_000);
         assert_eq!(compute_unit_limit(100_000, config), 100_000);
+    }
+
+    #[test]
+    fn reference_index_uses_the_v1_interval_width() {
+        const DEVNET_END_SLOT_INTERVAL: u64 = 107;
+
+        assert_eq!(reference_index_for_slot(0, DEVNET_END_SLOT_INTERVAL), 1);
+        assert_eq!(reference_index_for_slot(2_139, DEVNET_END_SLOT_INTERVAL), 1);
+        assert_eq!(reference_index_for_slot(2_140, DEVNET_END_SLOT_INTERVAL), 1);
+        assert_eq!(reference_index_for_slot(4_279, DEVNET_END_SLOT_INTERVAL), 1);
+        assert_eq!(reference_index_for_slot(4_280, DEVNET_END_SLOT_INTERVAL), 2);
     }
 }
