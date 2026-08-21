@@ -53,7 +53,7 @@ impl AccountResolver {
     /// Derive a market PDA.
     ///
     /// Seeds: `["market", market_id]`
-    pub fn market_pda(&self, market_id: u64) -> PdaResult {
+    pub fn market_pda(&self, market_id: u32) -> PdaResult {
         PdaResult::find(&[seeds::MARKET, &market_id.to_le_bytes()], &self.program_id)
     }
 
@@ -85,7 +85,7 @@ impl AccountResolver {
         &self,
         market: &Pubkey,
         authority: &Pubkey,
-        position_id: u64,
+        position_id: u32,
     ) -> PdaResult {
         PdaResult::find(
             &[
@@ -118,18 +118,49 @@ impl AccountResolver {
         )
     }
 
-    /// Derive an associated token account address.
+    /// Derive a legacy SPL Token associated token account address.
     ///
-    /// This uses the standard Associated Token Program derivation.
+    /// Use [`Self::associated_token_account_with_program_id`] when the mint may
+    /// be owned by Token-2022.
     pub fn associated_token_account(&self, wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
-        anchor_spl::associated_token::get_associated_token_address(wallet, mint)
+        self.associated_token_account_with_program_id(wallet, mint, &anchor_spl::token::ID)
     }
 
-    /// Derive a token vault PDA for a market.
+    /// Derive an associated token account address for a specific token program.
     ///
-    /// This is an Associated Token Account owned by the market PDA.
+    /// The token program is part of the ATA seeds, so the same wallet and mint
+    /// produce different addresses for legacy SPL Token and Token-2022.
+    pub fn associated_token_account_with_program_id(
+        &self,
+        wallet: &Pubkey,
+        mint: &Pubkey,
+        token_program_id: &Pubkey,
+    ) -> Pubkey {
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            wallet,
+            mint,
+            token_program_id,
+        )
+    }
+
+    /// Derive a legacy SPL Token vault address for a market.
+    ///
+    /// Use [`Self::market_vault_with_program_id`] when the mint may be owned by
+    /// Token-2022.
     pub fn market_vault(&self, market: &Pubkey, mint: &Pubkey) -> Pubkey {
         self.associated_token_account(market, mint)
+    }
+
+    /// Derive a token vault address for a market and a specific token program.
+    ///
+    /// The vault is an associated token account owned by the market PDA.
+    pub fn market_vault_with_program_id(
+        &self,
+        market: &Pubkey,
+        mint: &Pubkey,
+        token_program_id: &Pubkey,
+    ) -> Pubkey {
+        self.associated_token_account_with_program_id(market, mint, token_program_id)
     }
 }
 
@@ -203,6 +234,24 @@ mod tests {
     }
 
     #[test]
+    fn test_market_pda_uses_four_byte_id_seed() {
+        let program_id = Pubkey::new_unique();
+        let resolver = AccountResolver::new(program_id);
+        let market_id = 0x0102_0304_u32;
+
+        let actual = resolver.market_pda(market_id);
+        let (expected, expected_bump) =
+            Pubkey::find_program_address(&[seeds::MARKET, &market_id.to_le_bytes()], &program_id);
+        let (legacy_eight_byte_address, _) = Pubkey::find_program_address(
+            &[seeds::MARKET, &u64::from(market_id).to_le_bytes()],
+            &program_id,
+        );
+
+        assert_eq!(actual.address_and_bump(), (expected, expected_bump));
+        assert_ne!(actual.address(), legacy_eight_byte_address);
+    }
+
+    #[test]
     fn test_liquidity_position_pda_differs_by_authority() {
         let program_id = Pubkey::new_unique();
         let resolver = AccountResolver::new(program_id);
@@ -227,6 +276,84 @@ mod tests {
         let pos2 = resolver.trade_position_pda(&market, &authority, 2);
 
         assert_ne!(pos1.address(), pos2.address());
+    }
+
+    #[test]
+    fn test_trade_position_pda_uses_four_byte_id_seed() {
+        let program_id = Pubkey::new_unique();
+        let resolver = AccountResolver::new(program_id);
+        let market = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let position_id = 0x0506_0708_u32;
+
+        let actual = resolver.trade_position_pda(&market, &authority, position_id);
+        let (expected, expected_bump) = Pubkey::find_program_address(
+            &[
+                seeds::TRADE_POSITION,
+                market.as_ref(),
+                authority.as_ref(),
+                &position_id.to_le_bytes(),
+            ],
+            &program_id,
+        );
+        let (legacy_eight_byte_address, _) = Pubkey::find_program_address(
+            &[
+                seeds::TRADE_POSITION,
+                market.as_ref(),
+                authority.as_ref(),
+                &u64::from(position_id).to_le_bytes(),
+            ],
+            &program_id,
+        );
+
+        assert_eq!(actual.address_and_bump(), (expected, expected_bump));
+        assert_ne!(actual.address(), legacy_eight_byte_address);
+    }
+
+    #[test]
+    fn test_associated_token_addresses_include_token_program_id() {
+        let resolver = AccountResolver::new(Pubkey::new_unique());
+        let wallet = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let legacy = resolver.associated_token_account(&wallet, &mint);
+        let explicit_legacy = resolver.associated_token_account_with_program_id(
+            &wallet,
+            &mint,
+            &anchor_spl::token::ID,
+        );
+        let token_2022 = resolver.associated_token_account_with_program_id(
+            &wallet,
+            &mint,
+            &anchor_spl::token_2022::ID,
+        );
+
+        assert_eq!(legacy, explicit_legacy);
+        assert_ne!(legacy, token_2022);
+        assert_eq!(
+            token_2022,
+            anchor_spl::associated_token::get_associated_token_address_with_program_id(
+                &wallet,
+                &mint,
+                &anchor_spl::token_2022::ID,
+            )
+        );
+    }
+
+    #[test]
+    fn test_market_vault_includes_token_program_id() {
+        let resolver = AccountResolver::new(Pubkey::new_unique());
+        let market = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+
+        let legacy = resolver.market_vault(&market, &mint);
+        let explicit_legacy =
+            resolver.market_vault_with_program_id(&market, &mint, &anchor_spl::token::ID);
+        let token_2022 =
+            resolver.market_vault_with_program_id(&market, &mint, &anchor_spl::token_2022::ID);
+
+        assert_eq!(legacy, explicit_legacy);
+        assert_ne!(legacy, token_2022);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use twob_keepers::{
 
 declare_program!(twob_anchor);
 use twob_anchor::events::*;
+use twob_anchor::types::Side;
 
 const PROGRAM_LOG_PREFIX: &str = "Program log: ";
 const PROGRAM_DATA_PREFIX: &str = "Program data: ";
@@ -30,6 +31,7 @@ const PROGRAM_DATA_PREFIX: &str = "Program data: ";
 enum KeeperEvent {
     MarketUpdate(MarketUpdateEvent),
     ClosePosition(ClosePositionEvent),
+    AuthorityTransferred(AuthorityTransferred),
 }
 
 #[derive(Debug)]
@@ -228,14 +230,8 @@ async fn handle_logs_notification(
                 );
                 stats.record_market_event();
 
-                let record = MarketUpdateEventRecord {
-                    signature: signature.clone(),
-                    event_index: indexed_event.event_index,
-                    slot,
-                    market_id: event.market_id,
-                    base_flow: event.base_flow,
-                    quote_flow: event.quote_flow,
-                };
+                let record =
+                    market_update_record(&signature, indexed_event.event_index, slot, &event);
 
                 if let Err(error) = sink.insert_market_update_event(record).await {
                     stats.record_db_error();
@@ -249,30 +245,66 @@ async fn handle_logs_notification(
                 );
                 stats.record_close_event();
 
-                let record = ClosePositionEventRecord {
-                    signature: signature.clone(),
-                    event_index: indexed_event.event_index,
-                    slot,
-                    position_authority: event.position_authority.to_string(),
-                    market_id: event.market_id,
-                    start_slot: event.start_slot,
-                    end_slot: event.end_slot,
-                    deposit_amount: event.deposit_amount,
-                    swapped_amount: event.swapped_amount,
-                    remaining_amount: event.remaining_amount,
-                    fee_amount: event.fee_amount,
-                    is_buy: event.is_buy,
-                };
+                let record =
+                    close_position_record(&signature, indexed_event.event_index, slot, &event);
 
                 if let Err(error) = sink.insert_close_position_event(record).await {
                     stats.record_db_error();
                     eprintln!("Failed to insert close position event via sink: {error}");
                 }
             }
+            KeeperEvent::AuthorityTransferred(event) => {
+                println!(
+                    "AuthorityTransferred - Signature: {}, Slot: {}, New authority: {}",
+                    signature, slot, event.new_authority
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+fn market_update_record(
+    signature: &str,
+    event_index: u16,
+    slot: u64,
+    event: &MarketUpdateEvent,
+) -> MarketUpdateEventRecord {
+    MarketUpdateEventRecord {
+        signature: signature.to_owned(),
+        event_index,
+        slot,
+        market_id: u64::from(event.market_id),
+        base_flow: event.base_flow,
+        quote_flow: event.quote_flow,
+    }
+}
+
+fn close_position_record(
+    signature: &str,
+    event_index: u16,
+    slot: u64,
+    event: &ClosePositionEvent,
+) -> ClosePositionEventRecord {
+    ClosePositionEventRecord {
+        signature: signature.to_owned(),
+        event_index,
+        slot,
+        position_authority: event.position_authority.to_string(),
+        market_id: u64::from(event.market_id),
+        start_slot: event.start_slot,
+        end_slot: event.end_slot,
+        deposit_amount: event.deposit_amount,
+        swapped_amount: event.swapped_amount,
+        remaining_amount: event.remaining_amount,
+        fee_amount: event.fee_amount,
+        is_buy: side_to_is_buy(event.side),
+    }
+}
+
+fn side_to_is_buy(side: Side) -> u8 {
+    u8::from(matches!(side, Side::Buy))
 }
 
 fn parse_events_from_logs(
@@ -353,6 +385,13 @@ fn decode_event(log_bytes: &[u8]) -> std::result::Result<Option<KeeperEvent>, St
         return Ok(Some(KeeperEvent::ClosePosition(event)));
     }
 
+    if log_bytes.starts_with(AuthorityTransferred::DISCRIMINATOR) {
+        let mut data = &log_bytes[AuthorityTransferred::DISCRIMINATOR.len()..];
+        let event = AuthorityTransferred::deserialize(&mut data)
+            .map_err(|error| format!("AuthorityTransferred decode error: {error}"))?;
+        return Ok(Some(KeeperEvent::AuthorityTransferred(event)));
+    }
+
     Ok(None)
 }
 
@@ -413,4 +452,142 @@ fn optional_u64_as_string(value: Option<u64>) -> String {
     value
         .map(|inner| inner.to_string())
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::Event;
+
+    fn encoded_event<T: Event>(event: &T) -> Vec<u8> {
+        event.data()
+    }
+
+    #[test]
+    fn decodes_and_maps_current_market_update_event() {
+        let event = MarketUpdateEvent {
+            base_flow: 11,
+            quote_flow: 22,
+            market_id: u32::MAX,
+        };
+        let encoded = encoded_event(&event);
+
+        assert_eq!(
+            &encoded[..MarketUpdateEvent::DISCRIMINATOR.len()],
+            MarketUpdateEvent::DISCRIMINATOR
+        );
+
+        let decoded = decode_event(&encoded).expect("market update event should decode");
+        let KeeperEvent::MarketUpdate(decoded) = decoded.expect("event should be recognized")
+        else {
+            panic!("expected MarketUpdateEvent");
+        };
+        let record = market_update_record("market-signature", 7, 42, &decoded);
+
+        assert_eq!(record.signature, "market-signature");
+        assert_eq!(record.event_index, 7);
+        assert_eq!(record.slot, 42);
+        assert_eq!(record.market_id, u64::from(u32::MAX));
+        assert_eq!(record.base_flow, 11);
+        assert_eq!(record.quote_flow, 22);
+    }
+
+    #[test]
+    fn decodes_and_maps_current_close_position_event() {
+        let position_address = Pubkey::new_unique();
+        let position_authority = Pubkey::new_unique();
+        let base_receiver = Pubkey::new_unique();
+        let quote_receiver = Pubkey::new_unique();
+        let event = ClosePositionEvent {
+            position_address,
+            position_authority,
+            base_receiver,
+            quote_receiver,
+            deposit_amount: 100,
+            swapped_amount: 80,
+            remaining_amount: 20,
+            fee_amount: 1,
+            start_slot: 10,
+            end_slot: 30,
+            market_id: 4,
+            side: Side::Buy,
+        };
+        let encoded = encoded_event(&event);
+
+        assert_eq!(
+            &encoded[..ClosePositionEvent::DISCRIMINATOR.len()],
+            ClosePositionEvent::DISCRIMINATOR
+        );
+
+        let decoded = decode_event(&encoded).expect("close-position event should decode");
+        let KeeperEvent::ClosePosition(decoded) = decoded.expect("event should be recognized")
+        else {
+            panic!("expected ClosePositionEvent");
+        };
+        let record = close_position_record("close-signature", 3, 99, &decoded);
+
+        assert_eq!(decoded.position_address, position_address);
+        assert_eq!(decoded.base_receiver, base_receiver);
+        assert_eq!(decoded.quote_receiver, quote_receiver);
+        assert_eq!(record.signature, "close-signature");
+        assert_eq!(record.event_index, 3);
+        assert_eq!(record.slot, 99);
+        assert_eq!(record.position_authority, position_authority.to_string());
+        assert_eq!(record.market_id, 4);
+        assert_eq!(record.start_slot, 10);
+        assert_eq!(record.end_slot, 30);
+        assert_eq!(record.deposit_amount, 100);
+        assert_eq!(record.swapped_amount, 80);
+        assert_eq!(record.remaining_amount, 20);
+        assert_eq!(record.fee_amount, 1);
+        assert_eq!(record.is_buy, 1);
+        assert_eq!(side_to_is_buy(Side::Sell), 0);
+    }
+
+    #[test]
+    fn recognizes_authority_transfer_and_preserves_event_indexing() {
+        let authority_event = AuthorityTransferred {
+            new_authority: Pubkey::new_unique(),
+        };
+        let market_event = MarketUpdateEvent {
+            base_flow: 5,
+            quote_flow: 10,
+            market_id: 2,
+        };
+        let authority_bytes = encoded_event(&authority_event);
+        let market_bytes = encoded_event(&market_event);
+
+        assert_eq!(
+            &authority_bytes[..AuthorityTransferred::DISCRIMINATOR.len()],
+            AuthorityTransferred::DISCRIMINATOR
+        );
+        let decoded = decode_event(&authority_bytes).expect("authority event should decode");
+        let KeeperEvent::AuthorityTransferred(decoded) =
+            decoded.expect("authority event should be recognized")
+        else {
+            panic!("expected AuthorityTransferred");
+        };
+        assert_eq!(decoded.new_authority, authority_event.new_authority);
+
+        let program_id = twob_anchor::ID.to_string();
+        let logs = vec![
+            format!("Program {program_id} invoke [1]"),
+            format!("{PROGRAM_DATA_PREFIX}{}", STANDARD.encode(authority_bytes)),
+            format!("{PROGRAM_DATA_PREFIX}{}", STANDARD.encode(market_bytes)),
+            format!("Program {program_id} success"),
+        ];
+        let mut stats = IngestStats::new();
+        let events = parse_events_from_logs(&program_id, &logs, "signature", 1, &mut stats);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_index, 0);
+        assert!(matches!(
+            events[0].event,
+            KeeperEvent::AuthorityTransferred(_)
+        ));
+        assert_eq!(events[1].event_index, 1);
+        assert!(matches!(events[1].event, KeeperEvent::MarketUpdate(_)));
+        assert!(stats.unknown_discriminators.is_empty());
+        assert_eq!(stats.decode_errors, 0);
+    }
 }
