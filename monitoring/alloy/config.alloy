@@ -6,16 +6,16 @@ logging {
 prometheus.scrape "bookkeepers" {
 	targets = [
 		{
-			"__address__" = "bookkeeper-production-647d.up.railway.app:443",
-			"instance"    = "mainnet-market-1-40",
+			"__address__" = "bookkeeper.railway.internal:8080",
+			"instance"    = "mainnet-market-1",
 		},
 		{
-			"__address__" = "bookkeeper-copy-production.up.railway.app:443",
-			"instance"    = "mainnet-market-1-45",
+			"__address__" = "bookkeeper-backup.railway.internal:8080",
+			"instance"    = "mainnet-market-1-backup",
 		},
 	]
 
-	scheme          = "https"
+	scheme          = "http"
 	metrics_path    = "/metrics"
 	job_name        = "bookkeeper"
 	scrape_interval = "10s"

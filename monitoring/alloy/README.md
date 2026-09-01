@@ -32,9 +32,11 @@ with permission to write metrics and store it as a sealed Railway variable.
    Alloy clustering.
 
 The canary target is reached privately at
-`bookkeeper-canary.railway.internal:8080`. Both services must be in the same
-Railway project and environment. Deploy the canary before redeploying Alloy;
-see `../../docs/bookkeeper-canary.md`.
+`bookkeeper-canary.railway.internal:8080`. The primary and backup bookkeepers
+are reached at `bookkeeper.railway.internal:8080` and
+`bookkeeper-backup.railway.internal:8080`. All four services must be in the
+same Railway project and environment. Deploy the canary before redeploying
+Alloy; see `../../docs/bookkeeper-canary.md`.
 
 A public domain is optional. If one is enabled, these endpoints are useful:
 
@@ -54,7 +56,7 @@ up{job="bookkeeper"}
 ```
 
 There must be exactly two series, both with value `1`, for instances
-`mainnet-market-1-40` and `mainnet-market-1-45`. Then verify the application
+`mainnet-market-1` and `mainnet-market-1-backup`. Then verify the application
 metric and its thresholds:
 
 ```promql
