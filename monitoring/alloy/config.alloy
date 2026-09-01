@@ -1,0 +1,41 @@
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+prometheus.scrape "bookkeepers" {
+	targets = [
+		{
+			"__address__" = "bookkeeper-production-647d.up.railway.app:443",
+			"instance"    = "mainnet-market-1-40",
+		},
+		{
+			"__address__" = "bookkeeper-copy-production.up.railway.app:443",
+			"instance"    = "mainnet-market-1-45",
+		},
+	]
+
+	scheme          = "https"
+	metrics_path    = "/metrics"
+	job_name        = "bookkeeper"
+	scrape_interval = "10s"
+	scrape_timeout  = "5s"
+
+	forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+	external_labels = {
+		collector   = "railway-alloy",
+		environment = "mainnet",
+	}
+
+	endpoint {
+		url = sys.env("GRAFANA_CLOUD_PROMETHEUS_URL")
+
+		basic_auth {
+			username = sys.env("GRAFANA_CLOUD_PROMETHEUS_USERNAME")
+			password = sys.env("GRAFANA_CLOUD_API_TOKEN")
+		}
+	}
+}
