@@ -1,9 +1,9 @@
 # Bookkeeper Grafana Alloy collector
 
-This service scrapes both mainnet bookkeepers every 10 seconds and sends their
-Prometheus metrics to Grafana Cloud. The target addresses and instance labels
-are defined in `config.alloy`; Grafana Cloud credentials are supplied only as
-runtime environment variables.
+This service scrapes both mainnet bookkeepers and the independent on-chain
+canary every 10 seconds, then sends their Prometheus metrics to Grafana Cloud.
+The target addresses and instance labels are defined in `config.alloy`;
+Grafana Cloud credentials are supplied only as runtime environment variables.
 
 ## Required Railway variables
 
@@ -31,6 +31,11 @@ with permission to write metrics and store it as a sealed Railway variable.
    same series, so don't scale this service horizontally without configuring
    Alloy clustering.
 
+The canary target is reached privately at
+`bookkeeper-canary.railway.internal:8080`. Both services must be in the same
+Railway project and environment. Deploy the canary before redeploying Alloy;
+see `../../docs/bookkeeper-canary.md`.
+
 A public domain is optional. If one is enabled, these endpoints are useful:
 
 | Path | Purpose |
@@ -56,4 +61,13 @@ metric and its thresholds:
 bookkeeper_lag_slots{cluster="mainnet", market_id="1"}
 bookkeeper_warning_lag_slots{cluster="mainnet", market_id="1"}
 bookkeeper_critical_lag_slots{cluster="mainnet", market_id="1"}
+```
+
+Finally, verify that Alloy can scrape the independent canary and that the
+canary has completed a recent on-chain observation:
+
+```promql
+up{job="bookkeeper-canary"}
+bookkeeper_chain_lag_slots{cluster="mainnet", market_id="1"}
+time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster="mainnet", market_id="1"}
 ```

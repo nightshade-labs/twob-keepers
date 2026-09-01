@@ -10,6 +10,7 @@ read API for market data consumers.
 | Binary | Purpose |
 | --- | --- |
 | `bookkeeper` | Periodically checks a market's bookkeeping account and sends `update_books` when the configured slot interval has elapsed. |
+| `bookkeeper-canary` | Independently reads the mainnet market and bookkeeping accounts and exports chain-level freshness metrics without holding a payer or sending transactions. |
 | `event-keeper` | Subscribes to Solana transaction logs, decodes TwoB Anchor events, and writes market updates and close-position events to Tiger Cloud (TimescaleDB), recomputing 1-minute candles on every market update. |
 | `read-api` | Serves HTTP endpoints for market configs, latest price, price streams, candles, market history, recent updates, closed-position mini charts, and per-wallet closed positions. |
 | `trade-keeper` | Experimental keeper for publicly closing expired trade positions. It currently contains hard-coded defaults and should be reviewed before production use. |
@@ -124,6 +125,13 @@ The key gauges are `bookkeeper_lag_slots`,
 `bookkeeper_payer_balance_lamports`. Transaction, broadcast, RPC, blockhash
 expiry, and loop-outcome counters provide worker-level failure diagnostics.
 
+The separate `bookkeeper-canary` observes the same accounts through an
+independent mainnet RPC endpoint. It validates the cluster genesis hash,
+account ownership, and Anchor discriminators before publishing
+`bookkeeper_chain_*` metrics. This distinguishes a real on-chain freshness
+problem from a failure in one bookkeeper process or its RPC provider. See
+[`docs/bookkeeper-canary.md`](docs/bookkeeper-canary.md) for Railway deployment.
+
 `event-keeper` requires `DATABASE_URL` pointing at Tiger Cloud:
 
 ```bash
@@ -191,6 +199,12 @@ Run the bookkeeper for one market:
 cargo run --bin bookkeeper
 ```
 
+Run the read-only chain canary:
+
+```bash
+cargo run --bin bookkeeper-canary
+```
+
 Run the event ingester:
 
 ```bash
@@ -242,6 +256,7 @@ The Dockerfile builds one binary at a time using the `BIN_NAME` build argument:
 
 ```bash
 docker build --build-arg BIN_NAME=bookkeeper -t twob-bookkeeper .
+docker build --build-arg BIN_NAME=bookkeeper-canary -t bookkeeper-canary .
 docker build --build-arg BIN_NAME=event-keeper -t twob-event-keeper .
 docker build --build-arg BIN_NAME=read-api -t twob-read-api .
 ```

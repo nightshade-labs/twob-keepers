@@ -24,6 +24,23 @@ prometheus.scrape "bookkeepers" {
 	forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
 
+prometheus.scrape "bookkeeper_canary" {
+	targets = [
+		{
+			"__address__" = "bookkeeper-canary.railway.internal:8080",
+			"instance"    = "mainnet-market-1-chain",
+		},
+	]
+
+	scheme          = "http"
+	metrics_path    = "/metrics"
+	job_name        = "bookkeeper-canary"
+	scrape_interval = "10s"
+	scrape_timeout  = "5s"
+
+	forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
 prometheus.remote_write "grafana_cloud" {
 	external_labels = {
 		collector   = "railway-alloy",
