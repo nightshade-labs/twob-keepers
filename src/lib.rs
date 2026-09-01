@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod database;
+pub mod monitoring;
 pub mod sink;
 
 // Re-export commonly used types

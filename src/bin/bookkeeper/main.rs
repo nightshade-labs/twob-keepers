@@ -15,8 +15,11 @@ use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_types::config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig};
 use solana_transaction_status_client_types::TransactionStatus;
-use std::{env, future::Future, sync::Arc, time::Instant};
-use twob_keepers::{ARRAY_LENGTH, AccountResolver};
+use std::{env, future::Future, net::SocketAddr, sync::Arc, time::Instant};
+use twob_keepers::{
+    ARRAY_LENGTH, AccountResolver,
+    monitoring::{BookkeeperMonitoring, MonitoringConfig},
+};
 
 use tokio::time::{Duration, sleep};
 
@@ -39,6 +42,8 @@ const DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 40_000;
 const DEFAULT_COMPUTE_UNIT_MIN: u32 = 30_000;
 const DEFAULT_COMPUTE_UNIT_MAX: u32 = 100_000;
 const DEFAULT_COMPUTE_UNIT_MARGIN_BPS: u64 = 12_000;
+const DEFAULT_MONITOR_ACTIVITY_GRACE_MS: u64 = 15_000;
+const DEFAULT_BALANCE_POLL_INTERVAL_MS: u64 = 300_000;
 const SIMULATION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const BPS_DENOMINATOR: u64 = 10_000;
 const CONFIRMATION_COMMITMENT: CommitmentConfig = CommitmentConfig::confirmed();
@@ -59,6 +64,7 @@ struct BookkeeperConfig {
     compute_unit_min: u32,
     compute_unit_max: u32,
     compute_unit_margin_bps: u64,
+    balance_poll_interval: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +153,14 @@ impl TransactionRpc for RpcClient {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
+    let market_id: u64 = env::var("MARKET_ID")
+        .expect("MARKET_ID must be set")
+        .parse()
+        .expect("MARKET_ID must be a valid u64");
+    let config = BookkeeperConfig::from_env()?;
+    let monitoring = BookkeeperMonitoring::new(monitoring_config(market_id, config)?);
+    let mut monitoring_server = tokio::spawn(monitoring.clone().serve());
+
     let payer_bytes: Vec<u8> =
         serde_json::from_str(&env::var("PAYER_KEYPAIR").expect("PAYER_KEYPAIR must be set"))
             .expect("PAYER_KEYPAIR must be a valid JSON array of bytes");
@@ -156,12 +170,6 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("CLUSTER_RPC_URL").expect("CLUSTER_RPC_URL must be set");
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
     let url = Cluster::Custom(rpc_url, ws_url);
-
-    let market_id: u64 = env::var("MARKET_ID")
-        .expect("MARKET_ID must be set")
-        .parse()
-        .expect("MARKET_ID must be a valid u64");
-    let config = BookkeeperConfig::from_env()?;
 
     let payer = Arc::new(payer);
     let client = Client::new_with_options(url, payer.clone(), CommitmentConfig::confirmed());
@@ -175,8 +183,11 @@ async fn main() -> Result<()> {
 
     let market_account =
         retry_until_success("fetch market account", config.retry_backoff, || async {
-            program
-                .account::<Market>(market_pda.address())
+            monitoring
+                .observe_rpc(
+                    "get_market_account",
+                    program.account::<Market>(market_pda.address()),
+                )
                 .await
                 .context("failed to fetch market account")
         })
@@ -185,6 +196,7 @@ async fn main() -> Result<()> {
     if end_slot_interval == 0 {
         return Err(anyhow!("market end_slot_interval must be greater than 0"));
     }
+    monitoring.configure_freshness_boundary(end_slot_interval, ARRAY_LENGTH)?;
 
     println!(
         "Bookkeeper started for market_id={} slots_between_updates={} blockhash_attempts={} rebroadcast_interval={}s priority_fee_percentile={} priority_fee_range={}..{} micro_lamports compute_unit_range={}..{} min_update_delay={}s retry_backoff={}s..{}s",
@@ -203,18 +215,39 @@ async fn main() -> Result<()> {
     );
 
     let mut iteration_backoff = Backoff::new(config.retry_backoff);
+    let mut next_balance_poll = Instant::now();
     loop {
+        if monitoring_server.is_finished() {
+            return monitoring_server_failure(&mut monitoring_server).await;
+        }
+        monitoring.plan_activity_after(config.max_idle_sleep);
+
+        if Instant::now() >= next_balance_poll {
+            match monitoring
+                .observe_rpc("get_balance", rpc.get_balance(&payer.pubkey()))
+                .await
+            {
+                Ok(balance) => monitoring.set_payer_balance(balance),
+                Err(error) => eprintln!("Failed to fetch bookkeeper payer balance: {error:#}"),
+            }
+            next_balance_poll = Instant::now() + config.balance_poll_interval;
+        }
+
         let iteration = async {
             let payer = payer.clone();
-            let bookkeeping_account = program
-                .account::<Bookkeeping>(bookkeeping_pda.address())
+            let bookkeeping_account = monitoring
+                .observe_rpc(
+                    "get_bookkeeping_account",
+                    program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                )
                 .await
                 .context("failed to fetch bookkeeping account")?;
             let last_update_slot = bookkeeping_account.last_update_slot;
-            let current_slot = rpc
-                .get_slot()
+            let current_slot = monitoring
+                .observe_rpc("get_slot", rpc.get_slot())
                 .await
                 .context("failed to fetch current slot")?;
+            monitoring.observe_chain(current_slot, last_update_slot);
             log_book_staleness(current_slot, last_update_slot, end_slot_interval);
             let next_update_slot = last_update_slot.saturating_add(config.slots_between_updates);
 
@@ -261,11 +294,15 @@ async fn main() -> Result<()> {
                     .next()
                     .context("update_books instruction builder returned no instructions")?;
 
-                let refreshed_bookkeeping = program
-                    .account::<Bookkeeping>(bookkeeping_pda.address())
+                let refreshed_bookkeeping = monitoring
+                    .observe_rpc(
+                        "recheck_bookkeeping_before_signing",
+                        program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                    )
                     .await
                     .context("failed to recheck bookkeeping account before signing")?;
                 if refreshed_bookkeeping.last_update_slot >= reference_slot {
+                    monitoring.record_transaction("avoided_noop");
                     println!(
                         "Skipping update_books because target was already reached before signing reference_slot={} observed_last_update_slot={} outcome=avoided_no_op",
                         reference_slot, refreshed_bookkeeping.last_update_slot
@@ -285,11 +322,15 @@ async fn main() -> Result<()> {
 
                 for blockhash_attempt in 1..=config.send_retry_attempts {
                     if blockhash_attempt > 1 {
-                        let latest_bookkeeping = program
-                            .account::<Bookkeeping>(bookkeeping_pda.address())
+                        let latest_bookkeeping = monitoring
+                            .observe_rpc(
+                                "recheck_bookkeeping_after_expiry",
+                                program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                            )
                             .await
                             .context("failed to recheck bookkeeping after blockhash expiry")?;
                         if latest_bookkeeping.last_update_slot >= reference_slot {
+                            monitoring.record_transaction("avoided_noop");
                             println!(
                                 "Skipping replacement update_books because target was reached while the previous blockhash expired reference_slot={} observed_last_update_slot={} outcome=avoided_no_op",
                                 reference_slot, latest_bookkeeping.last_update_slot
@@ -298,10 +339,18 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    let priority_fee_micro_lamports =
-                        estimate_priority_fee(&rpc, &writable_accounts, config).await;
-                    let (blockhash, last_valid_block_height) = rpc
-                        .get_latest_blockhash_with_commitment(CONFIRMATION_COMMITMENT)
+                    let priority_fee_micro_lamports = estimate_priority_fee(
+                        &rpc,
+                        &writable_accounts,
+                        config,
+                        &monitoring,
+                    )
+                    .await;
+                    let (blockhash, last_valid_block_height) = monitoring
+                        .observe_rpc(
+                            "get_latest_blockhash",
+                            rpc.get_latest_blockhash_with_commitment(CONFIRMATION_COMMITMENT),
+                        )
                         .await
                         .context("failed to get latest blockhash")?;
 
@@ -312,18 +361,22 @@ async fn main() -> Result<()> {
                         SIMULATION_COMPUTE_UNIT_LIMIT,
                         priority_fee_micro_lamports,
                     );
-                    let compute_unit_limit = match rpc
-                        .simulate_transaction_with_config(
-                            &provisional_transaction,
-                            RpcSimulateTransactionConfig {
-                                commitment: Some(CONFIRMATION_COMMITMENT),
-                                ..RpcSimulateTransactionConfig::default()
-                            },
+                    let compute_unit_limit = match monitoring
+                        .observe_rpc(
+                            "simulate_transaction",
+                            rpc.simulate_transaction_with_config(
+                                &provisional_transaction,
+                                RpcSimulateTransactionConfig {
+                                    commitment: Some(CONFIRMATION_COMMITMENT),
+                                    ..RpcSimulateTransactionConfig::default()
+                                },
+                            ),
                         )
                         .await
                     {
                         Ok(response) => {
                             if let Some(error) = response.value.err {
+                                monitoring.record_transaction("simulation_failed");
                                 return Err(anyhow!(
                                     "update_books simulation failed for reference_slot={reference_slot}: {error:?}; logs={:?}",
                                     response.value.logs
@@ -376,6 +429,7 @@ async fn main() -> Result<()> {
                         &transaction,
                         last_valid_block_height,
                         config.rebroadcast_interval,
+                        &monitoring,
                     )
                     .await?
                     {
@@ -384,8 +438,13 @@ async fn main() -> Result<()> {
                             confirmed_slot,
                             elapsed,
                         } => {
-                            match program
-                                .account::<Bookkeeping>(bookkeeping_pda.address())
+                            monitoring.record_transaction("confirmed");
+                            monitoring.observe_confirmation_duration(elapsed);
+                            match monitoring
+                                .observe_rpc(
+                                    "get_bookkeeping_after_confirmation",
+                                    program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                                )
                                 .await
                             {
                                 Ok(after) if after.last_update_slot >= reference_slot => {
@@ -400,6 +459,7 @@ async fn main() -> Result<()> {
                                     );
                                 }
                                 Ok(after) => {
+                                    monitoring.record_transaction("confirmed_without_target");
                                     eprintln!(
                                         "BOOKKEEPER_CRITICAL confirmed update_books did not reach target signature={} reference_slot={} confirmed_slot={} observed_last_update_slot={} outcome=confirmed_without_target",
                                         signature,
@@ -421,6 +481,8 @@ async fn main() -> Result<()> {
                             broadcast_attempts,
                             elapsed,
                         } => {
+                            monitoring.record_transaction("expired");
+                            monitoring.record_blockhash_expiry();
                             eprintln!(
                                 "update_books blockhash expired without confirmation signature={} reference_slot={} blockhash_attempt={}/{} broadcast_attempts={} elapsed_ms={}; obtaining a fresh blockhash immediately",
                                 signature,
@@ -434,6 +496,7 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                monitoring.record_transaction("retry_exhausted");
                 Err(anyhow!(
                     "update_books did not confirm after {} blockhash lifetimes for reference_slot={reference_slot}",
                     config.send_retry_attempts
@@ -462,18 +525,22 @@ async fn main() -> Result<()> {
 
         match iteration {
             Ok(delay) => {
+                monitoring.record_iteration_success();
                 iteration_backoff.reset();
+                monitoring.plan_activity_after(delay);
                 if !delay.is_zero() {
-                    sleep(delay).await;
+                    sleep_or_monitoring_server_failure(delay, &mut monitoring_server).await?;
                 }
             }
             Err(error) => {
+                monitoring.record_iteration_failure(&error);
                 let delay = iteration_backoff.next_delay();
                 eprintln!(
                     "Bookkeeper iteration failed: {error:#}. Retrying in {} seconds",
                     seconds(delay)
                 );
-                sleep(delay).await;
+                monitoring.plan_activity_after(delay);
+                sleep_or_monitoring_server_failure(delay, &mut monitoring_server).await?;
             }
         }
     }
@@ -595,6 +662,15 @@ impl BookkeeperConfig {
                 "BOOKKEEPER_MAX_IDLE_SLEEP_MS must be greater than 0"
             ));
         }
+        let balance_poll_interval_ms = parse_u64_env(
+            "BOOKKEEPER_BALANCE_POLL_INTERVAL_MS",
+            DEFAULT_BALANCE_POLL_INTERVAL_MS,
+        )?;
+        if balance_poll_interval_ms == 0 {
+            return Err(anyhow!(
+                "BOOKKEEPER_BALANCE_POLL_INTERVAL_MS must be greater than 0"
+            ));
+        }
 
         Ok(Self {
             estimated_slot_duration_ms,
@@ -611,7 +687,72 @@ impl BookkeeperConfig {
             compute_unit_min,
             compute_unit_max,
             compute_unit_margin_bps,
+            balance_poll_interval: Duration::from_millis(balance_poll_interval_ms),
         })
+    }
+}
+
+fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<MonitoringConfig> {
+    let bind_addr = match env::var("BOOKKEEPER_MONITOR_BIND_ADDR") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .parse::<SocketAddr>()
+            .context("BOOKKEEPER_MONITOR_BIND_ADDR must be a valid socket address")?,
+        Ok(_) | Err(env::VarError::NotPresent) => {
+            let port = parse_u16_env("PORT", 8080)?;
+            SocketAddr::from(([0, 0, 0, 0], port))
+        }
+        Err(error) => {
+            return Err(anyhow!(
+                "Failed to read BOOKKEEPER_MONITOR_BIND_ADDR: {error}"
+            ));
+        }
+    };
+    let bookkeeper_id = env::var("BOOKKEEPER_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("RAILWAY_SERVICE_NAME").ok())
+        .unwrap_or_else(|| format!("market-{market_id}-{}-slots", config.slots_between_updates));
+    let cluster = env::var("BOOKKEEPER_CLUSTER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let activity_grace_ms = parse_u64_env(
+        "BOOKKEEPER_MONITOR_ACTIVITY_GRACE_MS",
+        DEFAULT_MONITOR_ACTIVITY_GRACE_MS,
+    )?;
+    if activity_grace_ms == 0 {
+        return Err(anyhow!(
+            "BOOKKEEPER_MONITOR_ACTIVITY_GRACE_MS must be greater than 0"
+        ));
+    }
+
+    Ok(MonitoringConfig {
+        bind_addr,
+        bookkeeper_id,
+        cluster,
+        market_id,
+        slots_between_updates: config.slots_between_updates,
+        activity_grace: Duration::from_millis(activity_grace_ms),
+    })
+}
+
+async fn sleep_or_monitoring_server_failure(
+    delay: Duration,
+    monitoring_server: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        _ = sleep(delay) => Ok(()),
+        _ = monitoring_server => Err(anyhow!("bookkeeper monitoring server stopped unexpectedly")),
+    }
+}
+
+async fn monitoring_server_failure(
+    monitoring_server: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    match monitoring_server.await {
+        Ok(Ok(())) => Err(anyhow!("bookkeeper monitoring server stopped unexpectedly")),
+        Ok(Err(error)) => Err(error.context("bookkeeper monitoring server stopped")),
+        Err(error) => Err(anyhow!("bookkeeper monitoring server task failed: {error}")),
     }
 }
 
@@ -619,8 +760,15 @@ async fn estimate_priority_fee(
     rpc: &RpcClient,
     writable_accounts: &[Pubkey],
     config: BookkeeperConfig,
+    monitoring: &BookkeeperMonitoring,
 ) -> u64 {
-    match rpc.get_recent_prioritization_fees(writable_accounts).await {
+    match monitoring
+        .observe_rpc(
+            "get_recent_prioritization_fees",
+            rpc.get_recent_prioritization_fees(writable_accounts),
+        )
+        .await
+    {
         Ok(fees) => priority_fee_from_samples(
             fees.into_iter().map(|fee| fee.prioritization_fee),
             config.priority_fee_percentile,
@@ -686,6 +834,7 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
     transaction: &Transaction,
     last_valid_block_height: u64,
     rebroadcast_interval: Duration,
+    monitoring: &BookkeeperMonitoring,
 ) -> Result<RebroadcastOutcome> {
     let signature = transaction
         .signatures
@@ -702,10 +851,15 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
     };
 
     loop {
+        monitoring.plan_activity_after(rebroadcast_interval);
         if broadcast_attempts > 0 {
-            match rpc.signature_status(&signature).await {
+            match monitoring
+                .observe_rpc("get_signature_status", rpc.signature_status(&signature))
+                .await
+            {
                 Ok(Some(status)) => {
                     if let Some(error) = status.err {
+                        monitoring.record_transaction("onchain_failed");
                         return Err(anyhow!(
                             "transaction {signature} failed on chain in slot {}: {error:?}",
                             status.slot
@@ -728,7 +882,10 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
             }
         }
 
-        match rpc.current_block_height().await {
+        match monitoring
+            .observe_rpc("get_block_height", rpc.current_block_height())
+            .await
+        {
             Ok(block_height) if block_height > last_valid_block_height => {
                 return Ok(RebroadcastOutcome::Expired {
                     broadcast_attempts,
@@ -744,20 +901,26 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
         }
 
         broadcast_attempts = broadcast_attempts.saturating_add(1);
-        match rpc.broadcast(transaction, send_config).await {
+        match monitoring
+            .observe_rpc("send_transaction", rpc.broadcast(transaction, send_config))
+            .await
+        {
             Ok(returned_signature) if returned_signature != signature => {
+                monitoring.record_broadcast("unexpected_signature");
                 return Err(anyhow!(
                     "sendTransaction returned unexpected signature {returned_signature}; expected {signature}"
                 ));
             }
             Ok(_) if broadcast_attempts == 1 || broadcast_attempts % 10 == 0 => {
+                monitoring.record_broadcast("success");
                 println!(
                     "Broadcast update_books signature={} attempt={}",
                     signature, broadcast_attempts
                 );
             }
-            Ok(_) => {}
+            Ok(_) => monitoring.record_broadcast("success"),
             Err(error) => {
+                monitoring.record_broadcast("failure");
                 eprintln!(
                     "Broadcast failed for signature={} attempt={}: {:#}. Will retry the same signed transaction in {} seconds",
                     signature,
@@ -775,12 +938,13 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
 fn log_book_staleness(current_slot: u64, last_update_slot: u64, end_slot_interval: u64) {
     let stale_slots = current_slot.saturating_sub(last_update_slot);
     let freshness_boundary_slots = end_slot_interval.saturating_mul(ARRAY_LENGTH);
+    let warning_slots = freshness_boundary_slots.saturating_mul(7).div_ceil(10);
     if stale_slots >= freshness_boundary_slots {
         eprintln!(
             "BOOKKEEPER_CRITICAL current_slot={} last_update_slot={} stale_slots={} freshness_boundary_slots={} freshness_remaining_slots=0",
             current_slot, last_update_slot, stale_slots, freshness_boundary_slots
         );
-    } else if stale_slots >= freshness_boundary_slots / 2 {
+    } else if stale_slots >= warning_slots {
         eprintln!(
             "BOOKKEEPER_STALENESS_WARNING current_slot={} last_update_slot={} stale_slots={} freshness_boundary_slots={} freshness_remaining_slots={}",
             current_slot,
@@ -876,6 +1040,16 @@ fn parse_u32_env(key: &str, default_value: u32) -> Result<u32> {
     }
 }
 
+fn parse_u16_env(key: &str, default_value: u16) -> Result<u16> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .parse::<u16>()
+            .with_context(|| format!("{key} must be a valid u16")),
+        Err(env::VarError::NotPresent) => Ok(default_value),
+        Err(error) => Err(anyhow!("Failed to read {key}: {error}")),
+    }
+}
+
 fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
@@ -955,7 +1129,19 @@ mod tests {
             compute_unit_min: DEFAULT_COMPUTE_UNIT_MIN,
             compute_unit_max: DEFAULT_COMPUTE_UNIT_MAX,
             compute_unit_margin_bps: DEFAULT_COMPUTE_UNIT_MARGIN_BPS,
+            balance_poll_interval: Duration::from_millis(DEFAULT_BALANCE_POLL_INTERVAL_MS),
         }
+    }
+
+    fn test_monitoring() -> BookkeeperMonitoring {
+        BookkeeperMonitoring::new(MonitoringConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            bookkeeper_id: "test".to_string(),
+            cluster: "test".to_string(),
+            market_id: 1,
+            slots_between_updates: 40,
+            activity_grace: Duration::from_secs(15),
+        })
     }
 
     #[tokio::test(start_paused = true)]
@@ -967,11 +1153,17 @@ mod tests {
             block_heights: Mutex::new(VecDeque::from([100, 101])),
             broadcast_signatures: Mutex::new(Vec::new()),
         };
+        let monitoring = test_monitoring();
 
-        let outcome =
-            rebroadcast_until_confirmed(&rpc, &transaction, 150, Duration::from_millis(1_500))
-                .await
-                .unwrap();
+        let outcome = rebroadcast_until_confirmed(
+            &rpc,
+            &transaction,
+            150,
+            Duration::from_millis(1_500),
+            &monitoring,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             outcome,
@@ -995,11 +1187,17 @@ mod tests {
             block_heights: Mutex::new(VecDeque::from([150, 151])),
             broadcast_signatures: Mutex::new(Vec::new()),
         };
+        let monitoring = test_monitoring();
 
-        let outcome =
-            rebroadcast_until_confirmed(&rpc, &transaction, 150, Duration::from_millis(1_500))
-                .await
-                .unwrap();
+        let outcome = rebroadcast_until_confirmed(
+            &rpc,
+            &transaction,
+            150,
+            Duration::from_millis(1_500),
+            &monitoring,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             outcome,

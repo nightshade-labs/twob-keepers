@@ -49,17 +49,22 @@ DATABASE_URL=postgres://tsdbadmin:<password>@<host>.tsdb.cloud.timescale.com:543
 ```bash
 PAYER_KEYPAIR=[...]
 MARKET_ID=1
-SLOTS_BETWEEN_UPDATES=100
+SLOTS_BETWEEN_UPDATES=40
 ```
 
 `PAYER_KEYPAIR` is expected to be a JSON array of keypair bytes.
 
-Run exactly one active `bookkeeper` replica per market. The process signs each
-update once, logs its signature immediately, and rebroadcasts that same signed
-transaction every 1.5 seconds until it is confirmed or its blockhash expires.
-Only an expired blockhash causes a newly signed transaction. The keeper also
-estimates a localized priority fee from the update's writable accounts and
-simulates the instruction to apply a tight compute-unit limit.
+The bookkeeper supports staggered active redundancy. Give every replica a
+unique `BOOKKEEPER_ID` and use different update cadences so one normally reaches
+the target first. Both replicas still operate independently and can race when
+the earlier replica is delayed; the pre-signing and post-expiry account checks
+avoid submitting an update after another replica has already reached the
+target. The process signs each update once, logs its signature immediately, and
+rebroadcasts that same signed transaction every 1.5 seconds until it is
+confirmed or its blockhash expires. Only an expired blockhash causes a newly
+signed transaction. The keeper also estimates a localized priority fee from the
+update's writable accounts and simulates the instruction to apply a tight
+compute-unit limit.
 
 Optional transaction tuning variables (defaults shown):
 
@@ -78,6 +83,46 @@ BOOKKEEPER_COMPUTE_UNIT_MARGIN_BPS=12000
 Route `BOOKKEEPER_STALENESS_WARNING` and `BOOKKEEPER_CRITICAL` log lines to
 alerts. They report slot lag, remaining slots before the one-array freshness
 boundary, and confirmed transactions that did not produce the expected state.
+
+### Bookkeeper monitoring
+
+The bookkeeper exposes Prometheus/OpenMetrics metrics and health endpoints on
+`BOOKKEEPER_MONITOR_BIND_ADDR`. If it is unset, the server uses `PORT`, then
+falls back to `0.0.0.0:8080`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/metrics` | Prometheus/OpenMetrics scrape target |
+| `GET` | `/livez` | Process/server liveness; always returns HTTP 200 while the server is alive |
+| `GET` | `/readyz` | Returns HTTP 503 while starting, stalled, or at critical lag |
+
+Every `bookkeeper_*` metric has `bookkeeper_id`, `cluster`, `market_id`, and
+`slots_between_updates` labels. Configure the identity explicitly for each
+service:
+
+```bash
+# 40-slot instance
+BOOKKEEPER_ID=mainnet-market-1-40
+BOOKKEEPER_CLUSTER=mainnet
+SLOTS_BETWEEN_UPDATES=40
+
+# 45-slot instance
+BOOKKEEPER_ID=mainnet-market-1-45
+BOOKKEEPER_CLUSTER=mainnet
+SLOTS_BETWEEN_UPDATES=45
+```
+
+The freshness boundary is read from the on-chain market account as
+`end_slot_interval * ARRAY_LENGTH`. Warning is `ceil(boundary * 70%)` and
+critical is the full boundary; there is no emergency state. Startup fails if a
+replica's configured cadence is at or above the warning threshold. For mainnet
+market 1, the currently observed boundary is 70 slots, warning is 49, and
+critical is 70, so both 40 and 45 are accepted.
+
+The key gauges are `bookkeeper_lag_slots`,
+`bookkeeper_freshness_remaining_slots`, `bookkeeper_overdue_slots`, and
+`bookkeeper_payer_balance_lamports`. Transaction, broadcast, RPC, blockhash
+expiry, and loop-outcome counters provide worker-level failure diagnostics.
 
 `event-keeper` requires `DATABASE_URL` pointing at Tiger Cloud:
 
