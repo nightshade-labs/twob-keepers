@@ -131,6 +131,9 @@ account ownership, and Anchor discriminators before publishing
 `bookkeeper_chain_*` metrics. This distinguishes a real on-chain freshness
 problem from a failure in one bookkeeper process or its RPC provider. See
 [`docs/bookkeeper-canary.md`](docs/bookkeeper-canary.md) for Railway deployment.
+The complete production topology, update flow, monitoring path, and failure
+model are documented in
+[`docs/bookkeeping-service-architecture.md`](docs/bookkeeping-service-architecture.md).
 
 `event-keeper` requires `DATABASE_URL` pointing at Tiger Cloud:
 

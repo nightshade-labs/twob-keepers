@@ -3,6 +3,10 @@
 This runbook covers mainnet market 1 for program
 `CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5`.
 
+For the system topology and the relationship between the two workers, canary,
+Alloy, Grafana Cloud, and Telegram, see
+[`docs/bookkeeping-service-architecture.md`](../../docs/bookkeeping-service-architecture.md).
+
 ## Production topology
 
 All services run in the same Railway project and production environment.
