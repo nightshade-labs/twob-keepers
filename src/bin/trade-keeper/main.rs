@@ -8,10 +8,12 @@ use anyhow::{Context, Result, anyhow};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::{env, sync::Arc};
 use tokio::time::{Duration, sleep};
-use twob_keepers::{ARRAY_LENGTH, AccountResolver};
+use twob_keepers::AccountResolver;
 
-declare_program!(twob_anchor);
+// This service still targets the previous deployment; migrate it separately from bookkeeper.
+declare_program!(twob_anchor_legacy);
 use twob_anchor::{client::accounts, client::args};
+use twob_anchor_legacy as twob_anchor;
 
 use crate::twob_anchor::accounts::{Market, TradePosition};
 
@@ -20,6 +22,8 @@ const REFERENCE_INDEX_LOOKAHEAD_SLOTS: u64 = 20;
 const MAX_IDLE_SLEEP: Duration = Duration::from_secs(60);
 const RETRY_SLEEP: Duration = Duration::from_secs(10);
 const POST_CLOSE_SLEEP: Duration = Duration::from_secs(1);
+// Matches the legacy IDL, not the current v1 bookkeeper's 30-entry intervals.
+const ARRAY_LENGTH: u64 = 20;
 
 // Keep synchronized with twob-anchor's MAXIMUM_DURATION_SLOTS. A paused position only becomes
 // publicly closable after this abandonment window has elapsed since its original start slot.
@@ -43,7 +47,7 @@ async fn main() -> Result<()> {
     let rpc = program.rpc();
     let resolver = AccountResolver::new(twob_anchor::ID);
 
-    let market_address = resolver.market_pda(market_id).address();
+    let market_address = resolver.legacy_market_pda(market_id).address();
     let bookkeeping_address = resolver.bookkeeping_pda(&market_address).address();
     let market_account = program
         .account::<Market>(market_address)

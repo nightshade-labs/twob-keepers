@@ -22,7 +22,13 @@ fn main() {
 
     // Example 2: Derive market PDA
     let market_id = 1u32;
-    let market = resolver.market_pda(market_id);
+    let base_mint = "So11111111111111111111111111111111111111112"
+        .parse()
+        .unwrap();
+    let quote_mint = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+        .parse()
+        .unwrap();
+    let market = resolver.market_pda(market_id, &base_mint, &quote_mint);
     println!("Market PDA (id={}):", market_id);
     println!("  Address: {}", market.address());
     println!("  Bump: {}", market.bump());

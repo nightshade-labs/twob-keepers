@@ -20,9 +20,11 @@ use twob_keepers::{
     TimescaleSink,
 };
 
-declare_program!(twob_anchor);
+// Preserve the previous program/event schema until the event/database migration is done.
+declare_program!(twob_anchor_legacy);
 use twob_anchor::events::*;
 use twob_anchor::types::Side;
+use twob_anchor_legacy as twob_anchor;
 
 const PROGRAM_LOG_PREFIX: &str = "Program log: ";
 const PROGRAM_DATA_PREFIX: &str = "Program data: ";

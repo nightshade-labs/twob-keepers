@@ -24,7 +24,7 @@ pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = anchor_spl::associated_token::ID
 /// # Example
 /// ```ignore
 /// let resolver = AccountResolver::new(program_id);
-/// let market_pda = resolver.market_pda(market_id);
+/// let market_pda = resolver.market_pda(market_id, &base_mint, &quote_mint);
 /// let (market_address, bump) = market_pda.address_and_bump();
 /// ```
 #[derive(Debug, Clone)]
@@ -52,8 +52,23 @@ impl AccountResolver {
 
     /// Derive a market PDA.
     ///
-    /// Seeds: `["market", market_id]`
-    pub fn market_pda(&self, market_id: u32) -> PdaResult {
+    /// Seeds: `["market", base_mint, quote_mint, market_id (u32 LE)]`.
+    /// Mint order is significant; IDs are scoped to the ordered mint pair.
+    pub fn market_pda(&self, market_id: u32, base_mint: &Pubkey, quote_mint: &Pubkey) -> PdaResult {
+        PdaResult::find(
+            &[
+                seeds::MARKET,
+                base_mint.as_ref(),
+                quote_mint.as_ref(),
+                &market_id.to_le_bytes(),
+            ],
+            &self.program_id,
+        )
+    }
+
+    /// Derive a market for the previous program version (legacy trade-keeper only).
+    /// Current v1 callers must use [`Self::market_pda`] with the ordered mint pair.
+    pub fn legacy_market_pda(&self, market_id: u32) -> PdaResult {
         PdaResult::find(&[seeds::MARKET, &market_id.to_le_bytes()], &self.program_id)
     }
 
@@ -227,8 +242,10 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let resolver = AccountResolver::new(program_id);
 
-        let market1 = resolver.market_pda(1);
-        let market2 = resolver.market_pda(2);
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
+        let market1 = resolver.market_pda(1, &base_mint, &quote_mint);
+        let market2 = resolver.market_pda(2, &base_mint, &quote_mint);
 
         assert_ne!(market1.address(), market2.address());
     }
@@ -238,17 +255,58 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let resolver = AccountResolver::new(program_id);
         let market_id = 0x0102_0304_u32;
+        let base_mint = Pubkey::new_unique();
+        let quote_mint = Pubkey::new_unique();
 
-        let actual = resolver.market_pda(market_id);
-        let (expected, expected_bump) =
-            Pubkey::find_program_address(&[seeds::MARKET, &market_id.to_le_bytes()], &program_id);
+        let actual = resolver.market_pda(market_id, &base_mint, &quote_mint);
+        let (expected, expected_bump) = Pubkey::find_program_address(
+            &[
+                seeds::MARKET,
+                base_mint.as_ref(),
+                quote_mint.as_ref(),
+                &market_id.to_le_bytes(),
+            ],
+            &program_id,
+        );
         let (legacy_eight_byte_address, _) = Pubkey::find_program_address(
-            &[seeds::MARKET, &u64::from(market_id).to_le_bytes()],
+            &[
+                seeds::MARKET,
+                base_mint.as_ref(),
+                quote_mint.as_ref(),
+                &u64::from(market_id).to_le_bytes(),
+            ],
             &program_id,
         );
 
         assert_eq!(actual.address_and_bump(), (expected, expected_bump));
         assert_ne!(actual.address(), legacy_eight_byte_address);
+    }
+
+    #[test]
+    fn market_pda_scopes_ids_to_the_ordered_mint_pair() {
+        let resolver = AccountResolver::new(Pubkey::new_unique());
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let market = resolver.market_pda(1, &base, &quote).address();
+        assert_ne!(market, resolver.market_pda(1, &quote, &base).address());
+        assert_ne!(market, resolver.market_pda(1, &other, &quote).address());
+        assert_ne!(market, resolver.market_pda(1, &base, &other).address());
+    }
+
+    #[test]
+    fn market_pda_matches_the_devnet_sol_usdc_deployment() {
+        let resolver = AccountResolver::new(crate::program_id());
+        let base = "So11111111111111111111111111111111111111112"
+            .parse()
+            .unwrap();
+        let quote = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            resolver.market_pda(1, &base, &quote).address().to_string(),
+            "F41sZg6i75dd8BC3ZbAqCkYGFtHRo3H1fD6anm4H8AsW"
+        );
     }
 
     #[test]

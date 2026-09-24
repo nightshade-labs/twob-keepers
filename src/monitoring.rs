@@ -35,6 +35,7 @@ pub struct MonitoringConfig {
     pub bookkeeper_id: String,
     pub cluster: String,
     pub market_id: u64,
+    pub market_address: String,
     pub slots_between_updates: u64,
     pub activity_grace: Duration,
 }
@@ -93,6 +94,7 @@ pub struct HealthResponse {
     bookkeeper_id: String,
     cluster: String,
     market_id: u64,
+    market_address: String,
     slots_between_updates: u64,
     current_slot: Option<u64>,
     last_update_slot: Option<u64>,
@@ -143,6 +145,10 @@ impl BookkeeperMonitoring {
                     Cow::Owned(config.bookkeeper_id.clone()),
                 ),
                 (Cow::Borrowed("cluster"), Cow::Owned(config.cluster.clone())),
+                (
+                    Cow::Borrowed("market_address"),
+                    Cow::Owned(config.market_address.clone()),
+                ),
                 (
                     Cow::Borrowed("market_id"),
                     Cow::Owned(config.market_id.to_string()),
@@ -384,6 +390,7 @@ impl BookkeeperMonitoring {
                 bookkeeper_id: self.config.bookkeeper_id.clone(),
                 cluster: self.config.cluster.clone(),
                 market_id: self.config.market_id,
+                market_address: self.config.market_address.clone(),
                 slots_between_updates: self.config.slots_between_updates,
                 current_slot: health.current_slot,
                 last_update_slot: health.last_update_slot,
@@ -598,6 +605,7 @@ mod tests {
             bookkeeper_id: "primary".to_string(),
             cluster: "mainnet".to_string(),
             market_id: 1,
+            market_address: "F41sZg6i75dd8BC3ZbAqCkYGFtHRo3H1fD6anm4H8AsW".to_string(),
             slots_between_updates,
             activity_grace: Duration::from_secs(15),
         })
@@ -619,6 +627,25 @@ mod tests {
         let monitoring = monitoring(49);
         let error = monitoring.configure_freshness_boundary(7, 10).unwrap_err();
         assert!(error.to_string().contains("must be less than"));
+    }
+
+    #[test]
+    fn devnet_v1_thresholds_and_cadence_headroom() {
+        for cadence in [40, 45, 146] {
+            let monitoring = monitoring(cadence);
+            monitoring
+                .configure_freshness_boundary(crate::END_SLOT_INTERVAL, crate::ARRAY_LENGTH)
+                .unwrap();
+            let (health, _) = monitoring.health_response();
+            assert_eq!(health.freshness_boundary_slots, Some(210));
+            assert_eq!(health.warning_lag_slots, Some(147));
+            assert_eq!(health.critical_lag_slots, Some(210));
+        }
+        assert!(
+            monitoring(147)
+                .configure_freshness_boundary(crate::END_SLOT_INTERVAL, crate::ARRAY_LENGTH)
+                .is_err()
+        );
     }
 
     #[test]
@@ -647,6 +674,9 @@ mod tests {
 
         assert!(encoded.contains("bookkeeper_lag_slots"));
         assert!(encoded.contains("bookkeeper_id=\"primary\""));
+        assert!(
+            encoded.contains("market_address=\"F41sZg6i75dd8BC3ZbAqCkYGFtHRo3H1fD6anm4H8AsW\"")
+        );
         assert!(encoded.contains("slots_between_updates=\"45\""));
         assert!(!encoded.contains("twob_bookkeeper"));
     }

@@ -17,7 +17,7 @@ use solana_rpc_client_types::config::{RpcSendTransactionConfig, RpcSimulateTrans
 use solana_transaction_status_client_types::TransactionStatus;
 use std::{env, future::Future, net::SocketAddr, sync::Arc, time::Instant};
 use twob_keepers::{
-    ARRAY_LENGTH, AccountResolver,
+    ARRAY_LENGTH, AccountResolver, END_SLOT_INTERVAL,
     monitoring::{BookkeeperMonitoring, MonitoringConfig},
 };
 
@@ -153,12 +153,22 @@ impl TransactionRpc for RpcClient {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
-    let market_id: u64 = env::var("MARKET_ID")
-        .expect("MARKET_ID must be set")
+    let market_id: u32 = env::var("MARKET_ID")
+        .context("MARKET_ID must be set")?
         .parse()
-        .expect("MARKET_ID must be a valid u64");
+        .context("MARKET_ID must be a valid u32")?;
+    let base_mint = read_pubkey_env("MARKET_BASE_MINT")?;
+    let quote_mint = read_pubkey_env("MARKET_QUOTE_MINT")?;
+    let resolver = AccountResolver::new(twob_anchor::ID);
+    let market_pda = resolver.market_pda(market_id, &base_mint, &quote_mint);
+    let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
     let config = BookkeeperConfig::from_env()?;
-    let monitoring = BookkeeperMonitoring::new(monitoring_config(market_id, config)?);
+    let monitoring = BookkeeperMonitoring::new(monitoring_config(
+        u64::from(market_id),
+        market_pda.address(),
+        config,
+    )?);
+    monitoring.configure_freshness_boundary(END_SLOT_INTERVAL, ARRAY_LENGTH)?;
     let mut monitoring_server = tokio::spawn(monitoring.clone().serve());
 
     let payer_bytes: Vec<u8> =
@@ -171,22 +181,11 @@ async fn main() -> Result<()> {
     let ws_url = env::var("CLUSTER_WS_URL").expect("CLUSTER_WS_URL must be set");
     let url = Cluster::Custom(rpc_url, ws_url);
 
-    let market_id: u32 = env::var("MARKET_ID")
-        .expect("MARKET_ID must be set")
-        .parse()
-        .expect("MARKET_ID must be a valid u32");
-    let config = BookkeeperConfig::from_env()?;
-
     let payer = Arc::new(payer);
     let client = Client::new_with_options(url, payer.clone(), CommitmentConfig::confirmed());
 
     let program = client.program(twob_anchor::ID)?;
     let rpc = program.rpc();
-    let resolver = AccountResolver::new(twob_anchor::ID);
-
-    let market_pda = resolver.market_pda(market_id);
-    let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
-
     let market_account =
         retry_until_success("fetch market account", config.retry_backoff, || async {
             monitoring
@@ -198,14 +197,19 @@ async fn main() -> Result<()> {
                 .context("failed to fetch market account")
         })
         .await;
-    let end_slot_interval = u64::from(market_account.end_slot_interval);
-    if end_slot_interval == 0 {
-        return Err(anyhow!("market end_slot_interval must be greater than 0"));
+    if market_account.id != market_id
+        || market_account.base_mint != base_mint
+        || market_account.quote_mint != quote_mint
+    {
+        return Err(anyhow!(
+            "market account does not match configured ID and mint pair"
+        ));
     }
-    monitoring.configure_freshness_boundary(end_slot_interval, ARRAY_LENGTH)?;
 
     println!(
-        "Bookkeeper started for market_id={} slots_between_updates={} blockhash_attempts={} rebroadcast_interval={}s priority_fee_percentile={} priority_fee_range={}..{} micro_lamports compute_unit_range={}..{} min_update_delay={}s retry_backoff={}s..{}s",
+        "Bookkeeper started for program={} market={} market_id={} slots_between_updates={} blockhash_attempts={} rebroadcast_interval={}s priority_fee_percentile={} priority_fee_range={}..{} micro_lamports compute_unit_range={}..{} min_update_delay={}s retry_backoff={}s..{}s",
+        twob_anchor::ID,
+        market_pda.address(),
         market_id,
         config.slots_between_updates,
         config.send_retry_attempts,
@@ -248,13 +252,16 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .context("failed to fetch bookkeeping account")?;
+            if bookkeeping_account.market != market_pda.address() {
+                return Err(anyhow!("bookkeeping account belongs to a different market"));
+            }
             let last_update_slot = bookkeeping_account.last_update_slot;
             let current_slot = monitoring
                 .observe_rpc("get_slot", rpc.get_slot())
                 .await
                 .context("failed to fetch current slot")?;
             monitoring.observe_chain(current_slot, last_update_slot);
-            log_book_staleness(current_slot, last_update_slot, end_slot_interval);
+            log_book_staleness(current_slot, last_update_slot);
             let next_update_slot = last_update_slot.saturating_add(config.slots_between_updates);
 
             if current_slot >= next_update_slot {
@@ -263,7 +270,7 @@ async fn main() -> Result<()> {
                     next_update_slot, current_slot, last_update_slot
                 );
                 let reference_slot = next_update_slot;
-                let reference_index = reference_index_for_slot(reference_slot, end_slot_interval);
+                let reference_index = reference_index_for_slot(reference_slot);
                 let previous_index = reference_index.checked_sub(1).with_context(|| {
                     format!(
                         "reference_index is 0 for reference_slot={reference_slot}; cannot derive previous accounts yet"
@@ -698,7 +705,11 @@ impl BookkeeperConfig {
     }
 }
 
-fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<MonitoringConfig> {
+fn monitoring_config(
+    market_id: u64,
+    market_address: Pubkey,
+    config: BookkeeperConfig,
+) -> Result<MonitoringConfig> {
     let bind_addr = match env::var("BOOKKEEPER_MONITOR_BIND_ADDR") {
         Ok(raw) if !raw.trim().is_empty() => raw
             .parse::<SocketAddr>()
@@ -717,7 +728,12 @@ fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<Monitor
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| env::var("RAILWAY_SERVICE_NAME").ok())
-        .unwrap_or_else(|| format!("market-{market_id}-{}-slots", config.slots_between_updates));
+        .unwrap_or_else(|| {
+            format!(
+                "market-{market_address}-{}-slots",
+                config.slots_between_updates
+            )
+        });
     let cluster = env::var("BOOKKEEPER_CLUSTER")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -737,6 +753,7 @@ fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<Monitor
         bookkeeper_id,
         cluster,
         market_id,
+        market_address: market_address.to_string(),
         slots_between_updates: config.slots_between_updates,
         activity_grace: Duration::from_millis(activity_grace_ms),
     })
@@ -941,14 +958,14 @@ async fn rebroadcast_until_confirmed<R: TransactionRpc>(
     }
 }
 
-fn reference_index_for_slot(slot: u64, end_slot_interval: u64) -> u64 {
+fn reference_index_for_slot(slot: u64) -> u64 {
     // Index zero is reserved because every update also supplies reference_index - 1.
-    (slot / end_slot_interval / ARRAY_LENGTH).max(1)
+    (slot / END_SLOT_INTERVAL / ARRAY_LENGTH).max(1)
 }
 
-fn log_book_staleness(current_slot: u64, last_update_slot: u64, end_slot_interval: u64) {
+fn log_book_staleness(current_slot: u64, last_update_slot: u64) {
     let stale_slots = current_slot.saturating_sub(last_update_slot);
-    let freshness_boundary_slots = end_slot_interval.saturating_mul(ARRAY_LENGTH);
+    let freshness_boundary_slots = END_SLOT_INTERVAL * ARRAY_LENGTH;
     let warning_slots = freshness_boundary_slots.saturating_mul(7).div_ceil(10);
     if stale_slots >= freshness_boundary_slots {
         eprintln!(
@@ -1022,6 +1039,14 @@ where
             }
         }
     }
+}
+
+fn read_pubkey_env(key: &str) -> Result<Pubkey> {
+    env::var(key)
+        .with_context(|| format!("{key} must be set to select a v1 market"))?
+        .trim()
+        .parse()
+        .with_context(|| format!("{key} must be a valid Solana public key"))
 }
 
 fn parse_required_u64_env(key: &str, validation_message: &str) -> Result<u64> {
@@ -1150,6 +1175,7 @@ mod tests {
             bookkeeper_id: "test".to_string(),
             cluster: "test".to_string(),
             market_id: 1,
+            market_address: "F41sZg6i75dd8BC3ZbAqCkYGFtHRo3H1fD6anm4H8AsW".to_string(),
             slots_between_updates: 40,
             activity_grace: Duration::from_secs(15),
         })
@@ -1244,12 +1270,60 @@ mod tests {
 
     #[test]
     fn reference_index_uses_the_v1_interval_width() {
-        const DEVNET_END_SLOT_INTERVAL: u64 = 107;
+        assert_eq!(reference_index_for_slot(0), 1);
+        assert_eq!(reference_index_for_slot(209), 1);
+        assert_eq!(reference_index_for_slot(210), 1);
+        assert_eq!(reference_index_for_slot(419), 1);
+        assert_eq!(reference_index_for_slot(420), 2);
+        assert_eq!(reference_index_for_slot(629), 2);
+        assert_eq!(reference_index_for_slot(630), 3);
+    }
 
-        assert_eq!(reference_index_for_slot(0, DEVNET_END_SLOT_INTERVAL), 1);
-        assert_eq!(reference_index_for_slot(2_139, DEVNET_END_SLOT_INTERVAL), 1);
-        assert_eq!(reference_index_for_slot(2_140, DEVNET_END_SLOT_INTERVAL), 1);
-        assert_eq!(reference_index_for_slot(4_279, DEVNET_END_SLOT_INTERVAL), 1);
-        assert_eq!(reference_index_for_slot(4_280, DEVNET_END_SLOT_INTERVAL), 2);
+    #[test]
+    fn idl_program_id_matches_shared_program_id() {
+        assert_eq!(twob_anchor::ID, twob_keepers::program_id());
+    }
+
+    #[test]
+    fn decodes_deployed_v1_market_and_bookkeeping() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        // Public devnet account bytes, independent of generated Rust serialization.
+        // This catches layout drift, especially Bookkeeping's new leading market key.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/devnet-sol-usdc.json"))
+                .unwrap();
+        assert_eq!(
+            fixture["program"].as_str().unwrap(),
+            twob_anchor::ID.to_string()
+        );
+        let market_data = STANDARD
+            .decode(fixture["market_data"].as_str().unwrap())
+            .unwrap();
+        let book_data = STANDARD
+            .decode(fixture["bookkeeping_data"].as_str().unwrap())
+            .unwrap();
+        let market = Market::try_deserialize(&mut market_data.as_slice()).unwrap();
+        let books = Bookkeeping::try_deserialize(&mut book_data.as_slice()).unwrap();
+        let resolver = AccountResolver::new(twob_anchor::ID);
+        let market_pda = resolver.market_pda(market.id, &market.base_mint, &market.quote_mint);
+        assert_eq!(market.id, 1);
+        assert_eq!(market.kind, 1); // Dedicated maker.
+        assert_eq!(
+            market_pda.address().to_string(),
+            fixture["market_address"].as_str().unwrap()
+        );
+        assert_eq!(market.bump, market_pda.bump());
+        assert_eq!(books.market, market_pda.address());
+        assert_eq!(
+            books.last_update_slot,
+            fixture["expected_last_update_slot"].as_u64().unwrap()
+        );
+        let book_pda = resolver.bookkeeping_pda(&books.market);
+        assert_eq!(
+            book_pda.address().to_string(),
+            fixture["bookkeeping_address"].as_str().unwrap()
+        );
+        assert_eq!(books.bump, book_pda.bump());
     }
 }

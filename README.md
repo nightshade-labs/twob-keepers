@@ -18,6 +18,11 @@ read API for market data consumers.
 The shared library exports PDA resolution helpers, event sink abstractions, and
 the Tiger Cloud (TimescaleDB) sink implementation used by the binaries.
 
+On this `devnet` branch, **bookkeeper** targets the fresh v1 deployment
+`CCAdkkosRFpzrb1BAWHnrzVGHMg4nNmurFCQefn7JtLX`. The event and trade keepers
+retain the previous program interface; they need separate migrations before
+they can serve this new deployment. See [IDL versions](idls/README.md).
+
 ## Requirements
 
 - Rust 1.85 or newer
@@ -49,10 +54,40 @@ Transaction-sending keepers (`bookkeeper` and `trade-keeper`) also require:
 ```bash
 PAYER_KEYPAIR=[...]
 MARKET_ID=1
-SLOTS_BETWEEN_UPDATES=40
 ```
 
 `PAYER_KEYPAIR` is expected to be a JSON array of keypair bytes.
+
+The bookkeeper additionally requires both token mints because v1 market IDs are
+scoped to an **ordered mint pair**. For the new devnet SOL/USDC market:
+
+```bash
+CLUSTER_RPC_URL=https://api.devnet.solana.com
+CLUSTER_WS_URL=wss://api.devnet.solana.com
+MARKET_ID=1
+MARKET_BASE_MINT=So11111111111111111111111111111111111111112
+MARKET_QUOTE_MINT=4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+SLOTS_BETWEEN_UPDATES=40
+BOOKKEEPER_CLUSTER=devnet
+BOOKKEEPER_ID=devnet-sol-usdc-40
+```
+
+These settings derive market `F41sZg6i75dd8BC3ZbAqCkYGFtHRo3H1fD6anm4H8AsW`.
+The payer only needs devnet SOL for transaction fees; `update_books` is public
+and does not require maker or quote-operator authority. Run one instance per
+market (or staggered replicas). The other prepared devnet pairs use the same
+USDC quote mint:
+
+| MARKET_ID | Pair | MARKET_BASE_MINT |
+| --- | --- | --- |
+| 2 | Mato/USDC | `69zmVXSzZptwJo5cy5LfUxmrdE1mRkeRnnEqtYNrKBMc` |
+| 3 | Solana Beach/USDC | `5UodwdrKuvMkpYZqEAoeo5AbeX4fPzSeENEojJLZNUQR` |
+| 4 | Staking Facilities/USDC | `HxMsRrwZdg6fBVcZ5aqP3x18KVpmNG81kSncrCD7k13N` |
+
+After setting these variables and the payer secret in your service environment,
+rebuild and deploy the bookkeeper binary/image. Check `/readyz` and verify that
+`bookkeeper_last_update_slot` advances. Program ID changes require a rebuild;
+the ID comes from the bundled IDL, not an environment variable.
 
 The bookkeeper supports staggered active redundancy. Give every replica a
 unique `BOOKKEEPER_ID` and use different update cadences so one normally reaches
@@ -96,28 +131,29 @@ falls back to `0.0.0.0:8080`.
 | `GET` | `/livez` | Process/server liveness; always returns HTTP 200 while the server is alive |
 | `GET` | `/readyz` | Returns HTTP 503 while starting, stalled, or at critical lag |
 
-Every `bookkeeper_*` metric has `bookkeeper_id`, `cluster`, `market_id`, and
-`slots_between_updates` labels. Configure the identity explicitly for each
+Every `bookkeeper_*` metric has `bookkeeper_id`, `cluster`, `market_id`,
+`market_address`, and `slots_between_updates` labels. Configure the identity explicitly for each
 service:
 
 ```bash
 # 40-slot instance
-BOOKKEEPER_ID=mainnet-market-1-40
-BOOKKEEPER_CLUSTER=mainnet
+BOOKKEEPER_ID=devnet-sol-usdc-40
+BOOKKEEPER_CLUSTER=devnet
 SLOTS_BETWEEN_UPDATES=40
 
 # 45-slot instance
-BOOKKEEPER_ID=mainnet-market-1-45
-BOOKKEEPER_CLUSTER=mainnet
+BOOKKEEPER_ID=devnet-sol-usdc-45
+BOOKKEEPER_CLUSTER=devnet
 SLOTS_BETWEEN_UPDATES=45
 ```
 
-The freshness boundary is read from the on-chain market account as
-`end_slot_interval * ARRAY_LENGTH`. Warning is `ceil(boundary * 70%)` and
+The v1 freshness boundary is `END_SLOT_INTERVAL * ARRAY_LENGTH = 7 * 30 = 210`
+slots. These are program constants; v1 Market no longer stores a slot interval.
+Warning is `ceil(boundary * 70%)` and
 critical is the full boundary; there is no emergency state. Startup fails if a
-replica's configured cadence is at or above the warning threshold. For mainnet
-market 1, the currently observed boundary is 70 slots, warning is 49, and
-critical is 70, so both 40 and 45 are accepted.
+replica's configured cadence is at or above the warning threshold. Warning is
+147 slots and critical is 210, so both 40- and 45-slot replicas are accepted.
+Reference exits/prices indices use `max(1, slot / 210)`.
 
 The key gauges are `bookkeeper_lag_slots`,
 `bookkeeper_freshness_remaining_slots`, `bookkeeper_overdue_slots`, and

@@ -16,11 +16,13 @@ pub use sink::{
 };
 
 /// The TwoB Anchor program ID
-pub const TWOB_PROGRAM_ID: &str = "CCAd78ZgUBAFNQmCCD5z4oGuFzb8uXLw5kfnBcRvDw16";
+pub const TWOB_PROGRAM_ID: &str = "CCAdkkosRFpzrb1BAWHnrzVGHMg4nNmurFCQefn7JtLX";
 
 /// Parse the program ID from the constant string
 pub fn program_id() -> anchor_lang::prelude::Pubkey {
     TWOB_PROGRAM_ID.parse().expect("Invalid program ID")
 }
 
-pub const ARRAY_LENGTH: u64 = 20;
+// Keep synchronized with the deployed v1 program's constants.rs.
+pub const ARRAY_LENGTH: u64 = 30;
+pub const END_SLOT_INTERVAL: u64 = 7;
