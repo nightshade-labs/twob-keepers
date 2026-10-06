@@ -21,18 +21,13 @@ fn main() {
     println!();
 
     // Example 2: Derive market PDA
-    let market_id = 1u64;
-    let market = resolver.market_pda(market_id);
+    let market_id = 1u32;
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let market = resolver.market_pda(&base_mint, &quote_mint, market_id);
     println!("Market PDA (id={}):", market_id);
     println!("  Address: {}", market.address());
     println!("  Bump: {}", market.bump());
-    println!();
-
-    // Example 3: Derive bookkeeping account PDA
-    let bookkeeping = resolver.bookkeeping_pda(&market.address());
-    println!("Bookkeeping PDA:");
-    println!("  Address: {}", bookkeeping.address());
-    println!("  Bump: {}", bookkeeping.bump());
     println!();
 
     // Example 4: Derive liquidity position PDA
@@ -45,7 +40,7 @@ fn main() {
     println!();
 
     // Example 5: Derive trade position PDA
-    let position_id = 1u64;
+    let position_id = 1u32;
     let trade_position = resolver.trade_position_pda(&market.address(), &authority, position_id);
     println!("Trade Position PDA (id={}):", position_id);
     println!("  Authority: {}", authority);
@@ -53,20 +48,9 @@ fn main() {
     println!("  Bump: {}", trade_position.bump());
     println!();
 
-    // Example 6: Derive exits account PDA
-    let index = 0u64;
-    let exits = resolver.exits_pda(&market.address(), index);
-    println!("Exits PDA (index={}):", index);
-    println!("  Address: {}", exits.address());
-    println!("  Bump: {}", exits.bump());
-    println!();
-
-    // Example 7: Derive prices account PDA
-    let prices = resolver.prices_pda(&market.address(), index);
-    println!("Prices PDA (index={}):", index);
-    println!("  Address: {}", prices.address());
-    println!("  Bump: {}", prices.bump());
-    println!();
+    // Intervals combine exit flows and bookkeeping snapshots.
+    let interval = resolver.market_interval_pda(&market.address(), 1);
+    println!("Market interval: {}", interval.address());
 
     // Example 8: Derive associated token account
     let mint = Pubkey::new_unique();

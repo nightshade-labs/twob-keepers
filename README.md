@@ -9,11 +9,11 @@ read API for market data consumers.
 
 | Binary | Purpose |
 | --- | --- |
-| `bookkeeper` | Periodically checks a market's bookkeeping account and sends `update_books` when the configured slot interval has elapsed. |
-| `bookkeeper-canary` | Independently reads the mainnet market and bookkeeping accounts and exports chain-level freshness metrics without holding a payer or sending transactions. |
+| `bookkeeper` | Periodically checks a market's market account and sends `update_books` when the configured slot interval has elapsed. |
+| `bookkeeper-canary` | Independently reads the mainnet market account with embedded bookkeeping and exports chain-level freshness metrics without holding a payer or sending transactions. |
 | `event-keeper` | Subscribes to Solana transaction logs, decodes TwoB Anchor events, and writes market updates and close-position events to Tiger Cloud (TimescaleDB), recomputing 1-minute candles on every market update. |
 | `read-api` | Serves HTTP endpoints for market configs, latest price, price streams, candles, market history, recent updates, closed-position mini charts, and per-wallet closed positions. |
-| `trade-keeper` | Experimental keeper for publicly closing expired trade positions. It currently contains hard-coded defaults and should be reviewed before production use. |
+| `trade-keeper` | Closes ended trade positions and abandoned paused positions for `MARKET_ADDRESS`, using the stored receivers and each mint's token program. |
 | `liquidity-keeper` | Placeholder binary. |
 
 The shared library exports PDA resolution helpers, event sink abstractions, and
@@ -26,6 +26,12 @@ the Tiger Cloud (TimescaleDB) sink implementation used by the binaries.
 - A funded payer keypair for transaction-sending keepers
 - A Tiger Cloud (TimescaleDB / Postgres) database for market configuration,
   event storage, candles, and read-api queries (TLS required)
+
+## v1 upgrade
+
+This branch targets mainnet program `TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A`.
+See [the v1 upgrade guide](docs/v1-upgrade.md) for required environment, database,
+API, and monitoring changes before rollout.
 
 ## Setup
 
@@ -45,11 +51,11 @@ CLUSTER_WS_URL=wss://...
 DATABASE_URL=postgres://tsdbadmin:<password>@<host>.tsdb.cloud.timescale.com:5432/tsdb?sslmode=require
 ```
 
-`bookkeeper` also requires:
+`bookkeeper` and `trade-keeper` require (cadence is only used by `bookkeeper`):
 
 ```bash
 PAYER_KEYPAIR=[...]
-MARKET_ID=1
+MARKET_ADDRESS=<market-address>
 SLOTS_BETWEEN_UPDATES=40
 ```
 
@@ -97,7 +103,7 @@ falls back to `0.0.0.0:8080`.
 | `GET` | `/livez` | Process/server liveness; always returns HTTP 200 while the server is alive |
 | `GET` | `/readyz` | Returns HTTP 503 while starting, stalled, or at critical lag |
 
-Every `bookkeeper_*` metric has `bookkeeper_id`, `cluster`, `market_id`, and
+Every `bookkeeper_*` metric has `bookkeeper_id`, `cluster`, `market_address`, and
 `slots_between_updates` labels. Configure the identity explicitly for each
 service:
 
@@ -113,12 +119,9 @@ BOOKKEEPER_CLUSTER=mainnet
 SLOTS_BETWEEN_UPDATES=45
 ```
 
-The freshness boundary is read from the on-chain market account as
-`end_slot_interval * ARRAY_LENGTH`. Warning is `ceil(boundary * 70%)` and
-critical is the full boundary; there is no emergency state. Startup fails if a
-replica's configured cadence is at or above the warning threshold. For mainnet
-market 1, the currently observed boundary is 70 slots, warning is 49, and
-critical is 70, so both 40 and 45 are accepted.
+The v1 freshness boundary is `END_SLOT_INTERVAL * ARRAY_LENGTH = 11 * 16 = 176`
+slots. Warning starts at 124 slots and critical at 176. Startup fails if the
+configured cadence is at or above warning; existing 40/45-slot cadences remain valid.
 
 The key gauges are `bookkeeper_lag_slots`,
 `bookkeeper_freshness_remaining_slots`, `bookkeeper_overdue_slots`, and
@@ -152,22 +155,22 @@ READ_API_BIND_ADDR=0.0.0.0:8080
 
 The keeper and read-api expect these tables (see `docs/timescale-schema.sql`):
 
-- `raw_market_update_events` — hypertable of decoded market updates
-- `raw_close_position_events` — hypertable of decoded close-position events
-- `market_candles_1m` — hypertable of 1-minute OHLC candles, upserted by the
+- `v1_raw_market_update_events` — hypertable of decoded market updates
+- `v1_raw_close_position_events` — hypertable of decoded close-position events
+- `v1_market_candles_1m` — hypertable of 1-minute OHLC candles, upserted by the
   keeper on every market update
-- `market_configs` — market token decimals/metadata (used to compute prices)
+- `v1_market_configs` — market token decimals/metadata (used to compute prices)
 
 Candles are stored as true prices (`numeric`); the keeper computes them in SQL
-by joining `market_configs` for the token decimals. Empty minutes are not
+by joining `v1_market_configs` for the token decimals. Empty minutes are not
 written — the read-api gap-fills them by carrying the last close forward.
 
 Table-name overrides (defaults shown):
 
 | Variable | Default |
 | --- | --- |
-| `MARKET_UPDATES_TABLE` | `raw_market_update_events` |
-| `CANDLES_1M_TABLE` | `market_candles_1m` |
+| `MARKET_UPDATES_TABLE` | `v1_raw_market_update_events` |
+| `CANDLES_1M_TABLE` | `v1_market_candles_1m` |
 
 ## Known limitations / follow-ups
 
@@ -182,7 +185,7 @@ In practice this is low-risk: `logsSubscribe` does not replay history on
 reconnect, so a single keeper instance rarely sees duplicates, and the candle
 upsert is naturally idempotent (re-applying the same price does not move
 OHLC) — the only artifact is an occasional duplicate row in
-`raw_market_update_events` / `raw_close_position_events`, visible in `/history`
+`v1_raw_market_update_events` / `v1_raw_close_position_events`, visible in `/history`
 and `/updates`.
 
 **This must be addressed before** running the keeper active-active (multiple
@@ -231,25 +234,25 @@ Available endpoints:
 | --- | --- |
 | `GET` | `/healthz` |
 | `GET` | `/v1/markets` |
-| `GET` | `/v1/markets/{market_id}/config` |
-| `GET` | `/v1/markets/{market_id}/price` |
-| `GET` | `/v1/markets/{market_id}/stream` |
-| `GET` | `/v1/markets/{market_id}/candles?from=...&to=...&interval=1m` |
-| `GET` | `/v1/markets/{market_id}/history?start_slot=...&end_slot=...` |
-| `GET` | `/v1/markets/{market_id}/updates` |
-| `GET` | `/v1/markets/{market_id}/closed-position-mini-chart?start_slot=...&end_slot=...` |
-| `GET` | `/v1/authorities/{authority}/closed-positions?market_id=...&before_slot=...&limit=...` |
+| `GET` | `/v1/markets/{market_address}/config` |
+| `GET` | `/v1/markets/{market_address}/price` |
+| `GET` | `/v1/markets/{market_address}/stream` |
+| `GET` | `/v1/markets/{market_address}/candles?from=...&to=...&interval=1m` |
+| `GET` | `/v1/markets/{market_address}/history?start_slot=...&end_slot=...` |
+| `GET` | `/v1/markets/{market_address}/updates` |
+| `GET` | `/v1/markets/{market_address}/closed-position-mini-chart?start_slot=...&end_slot=...` |
+| `GET` | `/v1/authorities/{authority}/closed-positions?market_address=...&before_slot=...&limit=...` |
 
 Supported candle intervals are `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`.
 
 `/v1/markets` lists every market config (token mints, decimals, tickers) and
-`/v1/markets/{market_id}/config` returns a single one. Both send
+`/v1/markets/{market_address}/config` returns a single one. Both send
 `Cache-Control: public, max-age=300, stale-while-revalidate=60` since configs
 change very rarely.
 
 `/v1/authorities/{authority}/closed-positions` returns a wallet's closed
 positions newest-first. It pages with `before_slot`/`limit` (keyset, like
-`/updates`, max `limit` 5000) and returns `has_more`; `market_id` optionally
+`/updates`, max `limit` 5000) and returns `has_more`; `market_address` optionally
 filters to one market. Amounts are raw on-chain integers — scale them with the
 token decimals from the market-config endpoints.
 

@@ -9,7 +9,7 @@ Presentation copy: [Mato Bookkeeping — Mainnet Architecture in Miro](https://m
 ## Scope
 
 The production deployment maintains market `1` for program
-`CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5` on Solana mainnet. It contains
+`TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A` on Solana mainnet. It contains
 two independent transaction-sending bookkeepers, a read-only chain canary, a
 Grafana Alloy collector, and Grafana Cloud monitoring with Telegram
 notifications.
@@ -22,9 +22,9 @@ flowchart LR
     telegram["Telegram<br/>Bookkeeper alerts"]
 
     subgraph solana["Solana mainnet"]
-        program["TwoB program<br/>CCAm...3Bc5"]
+        program["TwoB program<br/>Twobw...WT4A"]
         market["Market 1 account"]
-        bookkeeping["Bookkeeping account<br/>last_update_slot"]
+        bookkeeping["Market account<br/>last_update_slot"]
         program --- market
         program --- bookkeeping
     end
@@ -74,7 +74,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | `bookkeeper` | Normally reaches the update target first at a 40-slot cadence. | Yes | Primary transaction path |
 | `bookkeeper-backup` | Independently attempts updates at a 45-slot cadence. | Yes | Continues when the primary is unavailable |
-| `bookkeeper-canary` | Reads and validates the real market and bookkeeping accounts through an independent RPC path. | No | Detects actual on-chain staleness and monitoring uncertainty |
+| `bookkeeper-canary` | Reads and validates the real market account with embedded bookkeeping through an independent RPC path. | No | Detects actual on-chain staleness and monitoring uncertainty |
 | `bookkeeper-alloy` | Scrapes all three `/metrics` endpoints over Railway private networking and remotely writes samples. | No | Buffers remote-write samples in its persistent WAL |
 | Grafana Cloud | Stores metrics, renders the dashboard, evaluates alerts, and routes notifications. | No | Central monitoring and notification plane |
 | Telegram | Delivers warning and critical notifications to the operations chat. | No | Human notification channel |
@@ -83,24 +83,24 @@ flowchart LR
 
 Each bookkeeper runs the same algorithm with a different configured cadence.
 They do not elect a leader and do not share process state. Safety comes from
-re-reading the on-chain bookkeeping account before signing and again after a
+re-reading the on-chain market account before signing and again after a
 blockhash expires.
 
 ```mermaid
 sequenceDiagram
     participant K as Bookkeeper replica
     participant R as Solana RPC
-    participant B as Bookkeeping account
+    participant B as Market account
     participant P as TwoB program
 
     loop Every worker iteration
-        K->>R: Read bookkeeping account and current slot
+        K->>R: Read market account and current slot
         R-->>K: last_update_slot and current_slot
         K->>K: next_update_slot = last_update_slot + cadence
         alt Current slot is before next update
             K->>K: Sleep until the next planned activity
         else Update is due
-            K->>R: Re-read bookkeeping account before signing
+            K->>R: Re-read market account before signing
             R-->>K: Latest last_update_slot
             alt Another replica already reached the target
                 K->>K: Record avoided_noop and wait
@@ -113,9 +113,9 @@ sequenceDiagram
                 end
                 alt Transaction confirmed
                     P->>B: Advance last_update_slot
-                    K->>R: Verify bookkeeping account reached target
+                    K->>R: Verify market account reached target
                 else Blockhash expired
-                    K->>R: Re-read bookkeeping account
+                    K->>R: Re-read market account
                     alt Other replica reached the target
                         K->>K: Record avoided_noop and wait
                     else Target still needs an update
@@ -128,7 +128,7 @@ sequenceDiagram
 ```
 
 The primary cadence is 40 slots and the backup cadence is 45 slots. Both are
-below the 49-slot informational warning boundary, so the primary normally
+below the 124-slot informational warning boundary, so the primary normally
 updates first while the backup remains close enough to take over without a
 freshness incident.
 
@@ -154,7 +154,7 @@ flowchart TB
     chainMetrics -->|"authoritative lag and observation age"| alloy
     alloy --> prometheus
 
-    prometheus --> freshness["Freshness critical<br/>chain lag >= 70 slots"]
+    prometheus --> freshness["Freshness critical<br/>chain lag >= 176 slots"]
     prometheus --> telemetry["Telemetry stale<br/>canary age >= 45 seconds"]
     prometheus --> redundancy["Redundancy lost<br/>healthy progressing replicas < 2"]
     prometheus --> balanceWarning["Balance warning<br/>minimum payer balance < 0.2 SOL"]
@@ -170,29 +170,29 @@ flowchart TB
 
 ### Freshness model
 
-The canary derives the critical freshness boundary from the market account:
+The canary derives the critical freshness boundary from the v1 protocol constants:
 
 ```text
-freshness_boundary_slots = end_slot_interval * ARRAY_LENGTH = 70
-informational_warning_slots = ceil(70 * 70%) = 49
-critical_lag_slots = 70
+freshness_boundary_slots = END_SLOT_INTERVAL * ARRAY_LENGTH = 176
+informational_warning_slots = ceil(176 * 70%) = 124
+critical_lag_slots = 176
 ```
 
-The 49-slot threshold is a dashboard aid only. It does not create a freshness
+The 124-slot threshold is a dashboard aid only. It does not create a freshness
 notification. Grafana sends the freshness alert only when the independently
-observed chain lag reaches 70 slots.
+observed chain lag reaches 176 slots.
 
 ### Production alerts
 
 | Rule | Signal | Condition | Severity |
 | --- | --- | --- | --- |
-| Bookkeeper freshness critical | `bookkeeper_chain_lag_slots` | At least the dynamic chain critical boundary, currently 70 slots | Critical |
+| Bookkeeper freshness critical | `bookkeeper_chain_lag_slots` | At least the protocol critical boundary, currently 176 slots | Critical |
 | Bookkeeper telemetry stale | Canary observation timestamp | Observation age at least 45 seconds, no data, or query error | Critical |
 | Bookkeeper redundancy lost | Worker scrape state and next expected activity | Fewer than two healthy, progressing replicas | Critical |
 | Bookkeeper payer balance warning | Lowest worker payer balance | Below 0.2 SOL and at least 0.1 SOL | Warning |
 | Bookkeeper payer balance critical | Lowest worker payer balance | Below 0.1 SOL | Critical |
 
-All rules carry `service=bookkeeper`, `environment=mainnet`, and `market_id=1`.
+All rules carry `service=bookkeeper`, `environment=mainnet`, and `market_address=<market-address>`.
 The notification policy matches `service=bookkeeper` and sends the result to
 Telegram.
 
@@ -213,7 +213,7 @@ Alloy exposes `/-/healthy`, `/-/ready`, and its own `/metrics` endpoint.
 | Observation | Likely interpretation | First action |
 | --- | --- | --- |
 | One worker is unavailable, chain lag remains healthy | Redundancy is degraded but bookkeeping continues. | Repair only the failed replica. |
-| Both workers are available, chain lag reaches 70 | Transactions are not advancing the on-chain account. | Check payer balances, RPC failures, simulations, priority fees, and transaction logs. |
+| Both workers are available, chain lag reaches 176 | Transactions are not advancing the on-chain account. | Check payer balances, RPC failures, simulations, priority fees, and transaction logs. |
 | Canary samples are stale | The authoritative monitoring path is unavailable; chain freshness is unknown. | Check canary RPC and Alloy remote write, then inspect worker logs separately. |
 | Worker metrics disappear but canary remains fresh | Collection or worker telemetry failed; chain state is still progressing. | Check Alloy targets and the affected Railway service. |
 | Both worker balances are low | Future transactions may fail even if freshness is currently healthy. | Verify payer addresses and refill safely. |

@@ -16,7 +16,7 @@ use crate::sink::{
 /// affected 1-minute candle.
 ///
 /// Price is computed in SQL at full `numeric` precision by joining
-/// `market_configs` for the token decimals, so the keeper never needs to read
+/// `v1_market_configs` for the token decimals, so the keeper never needs to read
 /// values back or carry decimals in process memory.
 ///
 /// Candle semantics (step-function price that persists between updates):
@@ -26,50 +26,50 @@ use crate::sink::{
 /// - `close` is the latest event's price (last write wins).
 ///
 /// If the raw insert hits `ON CONFLICT DO NOTHING` (duplicate) or the market has
-/// no `market_configs` row, the candle CTE simply produces no row and the candle
+/// no `v1_market_configs` row, the candle CTE simply produces no row and the candle
 /// is left untouched.
 const INSERT_MARKET_UPDATE_SQL: &str = "\
 WITH ev AS ( \
-    INSERT INTO raw_market_update_events \
-        (event_uid, signature, event_index, slot, market_id, base_flow, quote_flow, event_time) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+    INSERT INTO v1_raw_market_update_events \
+        (event_uid, signature, event_index, slot, market_address, base_flow, quote_flow, event_time) \
+    VALUES ($1, $2, $3, $4, $5, $6::text::numeric, $7::text::numeric, $8) \
     ON CONFLICT DO NOTHING \
-    RETURNING market_id, base_flow, quote_flow, event_time \
+    RETURNING market_address, base_flow, quote_flow, event_time \
 ), \
 p AS ( \
     SELECT \
-        ev.market_id, \
+        ev.market_address, \
         date_trunc('minute', ev.event_time) AS bucket_start, \
         (ev.quote_flow::numeric * power(10::numeric, mc.base_decimals::numeric)) \
             / (ev.base_flow::numeric * power(10::numeric, mc.quote_decimals::numeric)) AS price \
     FROM ev \
-    JOIN market_configs mc ON mc.market_id = ev.market_id \
+    JOIN v1_market_configs mc ON mc.market_address = ev.market_address \
     WHERE ev.base_flow <> 0 \
       AND mc.base_decimals IS NOT NULL \
       AND mc.quote_decimals IS NOT NULL \
 ) \
-INSERT INTO market_candles_1m (market_id, bucket_start, open, high, low, close, updated_at) \
+INSERT INTO v1_market_candles_1m (market_address, bucket_start, open, high, low, close, updated_at) \
 SELECT \
-    p.market_id, \
+    p.market_address, \
     p.bucket_start, \
     COALESCE( \
-        (SELECT c.close FROM market_candles_1m c \
-          WHERE c.market_id = p.market_id AND c.bucket_start < p.bucket_start \
+        (SELECT c.close FROM v1_market_candles_1m c \
+          WHERE c.market_address = p.market_address AND c.bucket_start < p.bucket_start \
           ORDER BY c.bucket_start DESC LIMIT 1), \
         p.price), \
     p.price, p.price, p.price, now() \
 FROM p \
-ON CONFLICT (market_id, bucket_start) DO UPDATE SET \
-    high  = GREATEST(market_candles_1m.high, EXCLUDED.close), \
-    low   = LEAST(market_candles_1m.low,  EXCLUDED.close), \
+ON CONFLICT (market_address, bucket_start) DO UPDATE SET \
+    high  = GREATEST(v1_market_candles_1m.high, EXCLUDED.close), \
+    low   = LEAST(v1_market_candles_1m.low,  EXCLUDED.close), \
     close = EXCLUDED.close, \
     updated_at = now()";
 
 const INSERT_CLOSE_POSITION_SQL: &str = "\
-INSERT INTO raw_close_position_events \
-    (event_uid, signature, event_index, slot, position_authority, market_id, start_slot, \
-     end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, event_time) \
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+INSERT INTO v1_raw_close_position_events \
+    (event_uid, signature, event_index, slot, position_authority, market_address, start_slot, \
+     end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, event_time, position_address, base_receiver, quote_receiver) \
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::numeric, $10::text::numeric, $11::text::numeric, $12::text::numeric, $13, $14, $15, $16, $17) \
 ON CONFLICT DO NOTHING";
 
 /// Build a TLS-enabled connection pool for Tiger Cloud (Timescale).
@@ -140,9 +140,9 @@ impl TimescaleSink {
                     &event.signature,
                     &(event.event_index as i32),
                     &(event.slot as i64),
-                    &(event.market_id as i64),
-                    &(event.base_flow as i64),
-                    &(event.quote_flow as i64),
+                    &event.market_address,
+                    &event.base_flow.to_string(),
+                    &event.quote_flow.to_string(),
                     &Utc::now(),
                 ],
             )
@@ -162,15 +162,18 @@ impl TimescaleSink {
                     &(event.event_index as i32),
                     &(event.slot as i64),
                     &event.position_authority,
-                    &(event.market_id as i64),
+                    &event.market_address,
                     &(event.start_slot as i64),
                     &(event.end_slot as i64),
-                    &(event.deposit_amount as i64),
-                    &(event.swapped_amount as i64),
-                    &(event.remaining_amount as i64),
-                    &(event.fee_amount as i64),
+                    &event.deposit_amount.to_string(),
+                    &event.swapped_amount.to_string(),
+                    &event.remaining_amount.to_string(),
+                    &event.fee_amount.to_string(),
                     &(event.is_buy != 0),
                     &Utc::now(),
+                    &event.position_address,
+                    &event.base_receiver,
+                    &event.quote_receiver,
                 ],
             )
             .await

@@ -9,11 +9,9 @@ use anchor_lang::solana_program::pubkey::Pubkey;
 pub mod seeds {
     pub const PROGRAM_CONFIG: &[u8] = b"program_config";
     pub const MARKET: &[u8] = b"market";
-    pub const BOOKKEEPING: &[u8] = b"bookkeeping";
     pub const LIQUIDITY_POSITION: &[u8] = b"liquidity_position";
     pub const TRADE_POSITION: &[u8] = b"trade_position";
-    pub const EXITS: &[u8] = b"exits";
-    pub const PRICES: &[u8] = b"prices";
+    pub const MARKET_INTERVAL: &[u8] = b"market_interval";
 }
 
 /// The Associated Token Program ID
@@ -24,7 +22,7 @@ pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey = anchor_spl::associated_token::ID
 /// # Example
 /// ```ignore
 /// let resolver = AccountResolver::new(program_id);
-/// let market_pda = resolver.market_pda(market_id);
+/// let market_pda = resolver.market_pda(&base_mint, &quote_mint, market_id);
 /// let (market_address, bump) = market_pda.address_and_bump();
 /// ```
 #[derive(Debug, Clone)]
@@ -50,18 +48,17 @@ impl AccountResolver {
         PdaResult::find(&[seeds::PROGRAM_CONFIG], &self.program_id)
     }
 
-    /// Derive a market PDA.
-    ///
-    /// Seeds: `["market", market_id]`
-    pub fn market_pda(&self, market_id: u64) -> PdaResult {
-        PdaResult::find(&[seeds::MARKET, &market_id.to_le_bytes()], &self.program_id)
-    }
-
-    /// Derive a bookkeeping account PDA.
-    ///
-    /// Seeds: `["bookkeeping", market]`
-    pub fn bookkeeping_pda(&self, market: &Pubkey) -> PdaResult {
-        PdaResult::find(&[seeds::BOOKKEEPING, market.as_ref()], &self.program_id)
+    /// Derive a market PDA, scoped to the ordered mint pair and a u32 ID.
+    pub fn market_pda(&self, base_mint: &Pubkey, quote_mint: &Pubkey, market_id: u32) -> PdaResult {
+        PdaResult::find(
+            &[
+                seeds::MARKET,
+                base_mint.as_ref(),
+                quote_mint.as_ref(),
+                &market_id.to_le_bytes(),
+            ],
+            &self.program_id,
+        )
     }
 
     /// Derive a liquidity position PDA.
@@ -85,7 +82,7 @@ impl AccountResolver {
         &self,
         market: &Pubkey,
         authority: &Pubkey,
-        position_id: u64,
+        position_id: u32,
     ) -> PdaResult {
         PdaResult::find(
             &[
@@ -98,22 +95,14 @@ impl AccountResolver {
         )
     }
 
-    /// Derive an exits account PDA.
-    ///
-    /// Seeds: `["exits", market, index]`
-    pub fn exits_pda(&self, market: &Pubkey, index: u64) -> PdaResult {
+    /// Derive a market interval PDA with a u64 interval index.
+    pub fn market_interval_pda(&self, market: &Pubkey, index: u64) -> PdaResult {
         PdaResult::find(
-            &[seeds::EXITS, market.as_ref(), &index.to_le_bytes()],
-            &self.program_id,
-        )
-    }
-
-    /// Derive a prices account PDA.
-    ///
-    /// Seeds: `["prices", market, index]`
-    pub fn prices_pda(&self, market: &Pubkey, index: u64) -> PdaResult {
-        PdaResult::find(
-            &[seeds::PRICES, market.as_ref(), &index.to_le_bytes()],
+            &[
+                seeds::MARKET_INTERVAL,
+                market.as_ref(),
+                &index.to_le_bytes(),
+            ],
             &self.program_id,
         )
     }
@@ -123,6 +112,35 @@ impl AccountResolver {
     /// This uses the standard Associated Token Program derivation.
     pub fn associated_token_account(&self, wallet: &Pubkey, mint: &Pubkey) -> Pubkey {
         anchor_spl::associated_token::get_associated_token_address(wallet, mint)
+    }
+
+    /// Derive an ATA for either SPL Token or Token-2022.
+    pub fn associated_token_account_with_program(
+        &self,
+        wallet: &Pubkey,
+        mint: &Pubkey,
+        token_program: &Pubkey,
+    ) -> Pubkey {
+        anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            wallet,
+            mint,
+            token_program,
+        )
+    }
+
+    /// Native SOL payouts use a temporary account derived from the position.
+    pub fn receiver_token_account(
+        &self,
+        position: &Pubkey,
+        receiver: &Pubkey,
+        mint: &Pubkey,
+        token_program: &Pubkey,
+    ) -> Pubkey {
+        if *mint == anchor_spl::token::spl_token::native_mint::ID {
+            PdaResult::find(&[position.as_ref()], &self.program_id).address()
+        } else {
+            self.associated_token_account_with_program(receiver, mint, token_program)
+        }
     }
 
     /// Derive a token vault PDA for a market.
@@ -196,10 +214,63 @@ mod tests {
         let program_id = Pubkey::new_unique();
         let resolver = AccountResolver::new(program_id);
 
-        let market1 = resolver.market_pda(1);
-        let market2 = resolver.market_pda(2);
+        let market1 = resolver.market_pda(&Pubkey::default(), &Pubkey::default(), 1);
+        let market2 = resolver.market_pda(&Pubkey::default(), &Pubkey::default(), 2);
 
         assert_ne!(market1.address(), market2.address());
+    }
+
+    #[test]
+    fn market_identity_includes_the_ordered_pair_and_u32_id() {
+        let resolver = AccountResolver::new(crate::program_id());
+        let base = Pubkey::new_unique();
+        let quote = Pubkey::new_unique();
+        let address = resolver.market_pda(&base, &quote, 1).address();
+        assert_ne!(address, resolver.market_pda(&quote, &base, 1).address());
+        let legacy_width = PdaResult::find(
+            &[
+                seeds::MARKET,
+                base.as_ref(),
+                quote.as_ref(),
+                &1u64.to_le_bytes(),
+            ],
+            resolver.program_id(),
+        );
+        assert_ne!(address, legacy_width.address());
+    }
+
+    #[test]
+    fn payouts_resolve_token_2022_and_native_sol_for_either_side() {
+        let resolver = AccountResolver::new(crate::program_id());
+        let position = Pubkey::new_unique();
+        let receiver = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_2022 = resolver.receiver_token_account(
+            &position,
+            &receiver,
+            &mint,
+            &anchor_spl::token_2022::ID,
+        );
+        assert_ne!(
+            token_2022,
+            resolver.associated_token_account(&receiver, &mint)
+        );
+        let native = resolver.receiver_token_account(
+            &position,
+            &receiver,
+            &anchor_spl::token::spl_token::native_mint::ID,
+            &anchor_spl::token::ID,
+        );
+        let other_receiver = Pubkey::new_unique();
+        assert_eq!(
+            native,
+            resolver.receiver_token_account(
+                &position,
+                &other_receiver,
+                &anchor_spl::token::spl_token::native_mint::ID,
+                &anchor_spl::token::ID,
+            )
+        );
     }
 
     #[test]

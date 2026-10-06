@@ -60,9 +60,9 @@ There must be exactly two series, both with value `1`, for instances
 metric and its thresholds:
 
 ```promql
-bookkeeper_lag_slots{cluster="mainnet", market_id="1"}
-bookkeeper_warning_lag_slots{cluster="mainnet", market_id="1"}
-bookkeeper_critical_lag_slots{cluster="mainnet", market_id="1"}
+bookkeeper_lag_slots{cluster="mainnet", market_address="<market-address>"}
+bookkeeper_warning_lag_slots{cluster="mainnet", market_address="<market-address>"}
+bookkeeper_critical_lag_slots{cluster="mainnet", market_address="<market-address>"}
 ```
 
 Finally, verify that Alloy can scrape the independent canary and that the
@@ -70,6 +70,6 @@ canary has completed a recent on-chain observation:
 
 ```promql
 up{job="bookkeeper-canary"}
-bookkeeper_chain_lag_slots{cluster="mainnet", market_id="1"}
-time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster="mainnet", market_id="1"}
+bookkeeper_chain_lag_slots{cluster="mainnet", market_address="<market-address>"}
+time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster="mainnet", market_address="<market-address>"}
 ```

@@ -25,9 +25,9 @@ use tokio::{
 use tower_http::cors::CorsLayer;
 use twob_keepers::database::connect_pool;
 
-const DEFAULT_MARKET_UPDATES_TABLE: &str = "raw_market_update_events";
-const DEFAULT_CANDLES_1M_TABLE: &str = "market_candles_1m";
-const DEFAULT_CLOSE_POSITION_EVENTS_TABLE: &str = "raw_close_position_events";
+const DEFAULT_MARKET_UPDATES_TABLE: &str = "v1_raw_market_update_events";
+const DEFAULT_CANDLES_1M_TABLE: &str = "v1_market_candles_1m";
+const DEFAULT_CLOSE_POSITION_EVENTS_TABLE: &str = "v1_raw_close_position_events";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_MAX_POINTS: usize = 1500;
 const ABSOLUTE_MAX_POINTS: usize = 5000;
@@ -152,7 +152,7 @@ struct HealthResponse {
 
 #[derive(Clone, Serialize)]
 struct LatestPriceResponse {
-    market_id: u64,
+    market_address: String,
     slot: u64,
     event_time: String,
     #[serde(skip_serializing)]
@@ -190,7 +190,7 @@ struct ClosedPositionMiniChartQuery {
 
 #[derive(Serialize)]
 struct CandleResponse {
-    market_id: u64,
+    market_address: String,
     interval: String,
     from: String,
     to: String,
@@ -209,7 +209,7 @@ struct CandleItem {
 
 #[derive(Serialize)]
 struct MarketHistoryResponse {
-    market_id: u64,
+    market_address: String,
     start_slot: u64,
     end_slot: u64,
     points: usize,
@@ -218,7 +218,7 @@ struct MarketHistoryResponse {
 
 #[derive(Serialize)]
 struct MarketUpdatesResponse {
-    market_id: u64,
+    market_address: String,
     before_slot: Option<u64>,
     has_more: bool,
     limit: usize,
@@ -228,7 +228,7 @@ struct MarketUpdatesResponse {
 
 #[derive(Serialize)]
 struct ClosedPositionMiniChartResponse {
-    market_id: u64,
+    market_address: String,
     start_slot: u64,
     end_slot: u64,
     points: usize,
@@ -243,7 +243,7 @@ struct ClosedPositionMiniChartItem {
 
 #[derive(Clone, Serialize)]
 struct MarketConfig {
-    market_id: u64,
+    market_address: String,
     base_mint: Option<String>,
     quote_mint: Option<String>,
     base_decimals: Option<i16>,
@@ -260,7 +260,7 @@ struct MarketConfigListResponse {
 
 #[derive(Deserialize)]
 struct ClosedPositionsQuery {
-    market_id: Option<u64>,
+    market_address: Option<String>,
     before_slot: Option<u64>,
     limit: Option<usize>,
 }
@@ -268,7 +268,7 @@ struct ClosedPositionsQuery {
 #[derive(Serialize)]
 struct ClosedPositionsResponse {
     authority: String,
-    market_id: Option<u64>,
+    market_address: Option<String>,
     before_slot: Option<u64>,
     has_more: bool,
     limit: usize,
@@ -278,10 +278,13 @@ struct ClosedPositionsResponse {
 
 #[derive(Serialize)]
 struct ClosedPositionItem {
+    position_address: String,
+    base_receiver: String,
+    quote_receiver: String,
     signature: String,
     event_index: u16,
     slot: u64,
-    market_id: u64,
+    market_address: String,
     start_slot: u64,
     end_slot: u64,
     deposit_amount: String,
@@ -293,16 +296,19 @@ struct ClosedPositionItem {
 }
 
 struct ClosedPositionRow {
+    position_address: String,
+    base_receiver: String,
+    quote_receiver: String,
     signature: String,
     event_index: i32,
     slot: i64,
-    market_id: i64,
+    market_address: String,
     start_slot: i64,
     end_slot: i64,
-    deposit_amount: i64,
-    swapped_amount: i64,
-    remaining_amount: i64,
-    fee_amount: i64,
+    deposit_amount: String,
+    swapped_amount: String,
+    remaining_amount: String,
+    fee_amount: String,
     is_buy: bool,
     event_time_ms: i64,
 }
@@ -313,7 +319,7 @@ struct MarketHistoryItem {
     signature: String,
     event_index: u16,
     slot: u64,
-    market_id: u64,
+    market_address: String,
     base_flow: String,
     quote_flow: String,
     created_at: String,
@@ -324,9 +330,9 @@ struct MarketHistoryRow {
     signature: String,
     event_index: i32,
     slot: i64,
-    market_id: i64,
-    base_flow: i64,
-    quote_flow: i64,
+    market_address: String,
+    base_flow: String,
+    quote_flow: String,
     event_time_ms: i64,
 }
 
@@ -342,7 +348,7 @@ enum CandleInterval {
 
 #[derive(Clone)]
 struct MarketPriceStreams {
-    channels: Arc<RwLock<HashMap<u64, broadcast::Sender<LatestPriceResponse>>>>,
+    channels: Arc<RwLock<HashMap<String, broadcast::Sender<LatestPriceResponse>>>>,
     runtime: PriceStreamRuntime,
     poll_interval: Duration,
 }
@@ -437,20 +443,32 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/markets", get(list_market_configs))
-        .route("/v1/markets/{market_id}/config", get(get_market_config))
+        .route(
+            "/v1/markets/{market_address}/config",
+            get(get_market_config),
+        )
         .route(
             "/v1/authorities/{authority}/closed-positions",
             get(get_closed_positions),
         )
-        .route("/v1/markets/{market_id}/price", get(get_latest_price))
-        .route("/v1/markets/{market_id}/stream", get(stream_market_price))
-        .route("/v1/markets/{market_id}/candles", get(get_candles))
-        .route("/v1/markets/{market_id}/history", get(get_market_history))
+        .route("/v1/markets/{market_address}/price", get(get_latest_price))
         .route(
-            "/v1/markets/{market_id}/closed-position-mini-chart",
+            "/v1/markets/{market_address}/stream",
+            get(stream_market_price),
+        )
+        .route("/v1/markets/{market_address}/candles", get(get_candles))
+        .route(
+            "/v1/markets/{market_address}/history",
+            get(get_market_history),
+        )
+        .route(
+            "/v1/markets/{market_address}/closed-position-mini-chart",
             get(get_closed_position_mini_chart),
         )
-        .route("/v1/markets/{market_id}/updates", get(get_market_updates))
+        .route(
+            "/v1/markets/{market_address}/updates",
+            get(get_market_updates),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -487,14 +505,17 @@ async fn list_market_configs(
 
 async fn get_market_config(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let config = query_market_configs(&state.pool, Some(market_id))
+    validate_market_address(&market_address)?;
+    let config = query_market_configs(&state.pool, Some(market_address.clone()))
         .await
         .map_err(|error| ApiError::internal(error.context("Failed to query market config")))?
         .into_iter()
         .next()
-        .ok_or_else(|| ApiError::not_found(format!("No config for market_id={market_id}")))?;
+        .ok_or_else(|| {
+            ApiError::not_found(format!("No config for market_address={market_address}"))
+        })?;
 
     Ok((
         [(header::CACHE_CONTROL, MARKET_CONFIG_CACHE_CONTROL)],
@@ -514,11 +535,14 @@ async fn get_closed_positions(
         )));
     }
 
+    if let Some(ref market_address) = query.market_address {
+        validate_market_address(market_address)?;
+    }
     let mut rows = query_closed_position_rows(
         &state.pool,
         &state.config.close_position_events_table,
         &authority,
-        query.market_id,
+        query.market_address.clone(),
         query.before_slot,
         limit.saturating_add(1),
     )
@@ -537,7 +561,7 @@ async fn get_closed_positions(
 
     Ok(Json(ClosedPositionsResponse {
         authority,
-        market_id: query.market_id,
+        market_address: query.market_address,
         before_slot: query.before_slot,
         has_more,
         limit,
@@ -548,17 +572,21 @@ async fn get_closed_positions(
 
 async fn get_latest_price(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
 ) -> Result<Json<LatestPriceResponse>, ApiError> {
-    let maybe_snapshot =
-        fetch_latest_price_snapshot(&state.pool, &state.config.market_updates_table, market_id)
-            .await
-            .map_err(|error| {
-                ApiError::internal(error.context("Failed to fetch latest price snapshot"))
-            })?;
+    validate_market_address(&market_address)?;
+    let maybe_snapshot = fetch_latest_price_snapshot(
+        &state.pool,
+        &state.config.market_updates_table,
+        market_address.clone(),
+    )
+    .await
+    .map_err(|error| ApiError::internal(error.context("Failed to fetch latest price snapshot")))?;
 
     let snapshot = maybe_snapshot.ok_or_else(|| {
-        ApiError::not_found(format!("No price available for market_id={market_id}"))
+        ApiError::not_found(format!(
+            "No price available for market_address={market_address}"
+        ))
     })?;
 
     Ok(Json(snapshot))
@@ -566,33 +594,43 @@ async fn get_latest_price(
 
 async fn stream_market_price(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let receiver = state.market_price_streams.subscribe(market_id).await;
+    validate_market_address(&market_address)?;
+    let receiver = state
+        .market_price_streams
+        .subscribe(market_address.clone())
+        .await;
 
-    let event_stream = stream::unfold(receiver, move |mut receiver| async move {
-        loop {
-            match receiver.recv().await {
-                Ok(snapshot) => {
-                    let event = match Event::default().event("price_update").json_data(&snapshot) {
-                        Ok(event) => event,
-                        Err(error) => {
-                            eprintln!(
-                                "Failed to encode price_update SSE payload for market_id={}: {}",
-                                market_id, error
-                            );
-                            continue;
-                        }
-                    };
-                    return Some((Ok::<Event, Infallible>(event), receiver));
+    let event_stream = stream::unfold(receiver, move |mut receiver| {
+        let market_address = market_address.clone();
+        async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(snapshot) => {
+                        let event = match Event::default()
+                            .event("price_update")
+                            .json_data(&snapshot)
+                        {
+                            Ok(event) => event,
+                            Err(error) => {
+                                eprintln!(
+                                    "Failed to encode price_update SSE payload for market_address={}: {}",
+                                    market_address, error
+                                );
+                                continue;
+                            }
+                        };
+                        return Some((Ok::<Event, Infallible>(event), receiver));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        eprintln!(
+                            "Price stream lagged for market_address={}; skipped {} event(s)",
+                            market_address, skipped
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    eprintln!(
-                        "Price stream lagged for market_id={}; skipped {} event(s)",
-                        market_id, skipped
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
         }
     });
@@ -606,9 +644,10 @@ async fn stream_market_price(
 
 async fn get_candles(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
     Query(query): Query<CandleQuery>,
 ) -> Result<Json<CandleResponse>, ApiError> {
+    validate_market_address(&market_address)?;
     if query.to <= query.from {
         return Err(ApiError::bad_request("'to' must be later than 'from'"));
     }
@@ -634,9 +673,6 @@ async fn get_candles(
         )));
     }
 
-    let market_id_i64 =
-        i64::try_from(market_id).map_err(|_| ApiError::bad_request("market_id out of range"))?;
-
     // Gap-filled, carry-forward candles directly from the 1m rollup. Empty
     // buckets get `locf` (last observation carried forward), seeded from the
     // last candle strictly before `from` so leading gaps render as flat doji.
@@ -650,11 +686,11 @@ async fn get_candles(
             locf( \
                 last(close, bucket_start), \
                 (SELECT c.close FROM {0} c \
-                   WHERE c.market_id = $1 AND c.bucket_start < $2 \
+                   WHERE c.market_address = $1 AND c.bucket_start < $2 \
                    ORDER BY c.bucket_start DESC LIMIT 1) \
             ) AS carried_close \
          FROM {0} \
-         WHERE market_id = $1 \
+         WHERE market_address = $1 \
            AND bucket_start >= $2 \
            AND bucket_start < $3 \
          GROUP BY 1 \
@@ -669,7 +705,7 @@ async fn get_candles(
         .query(
             &sql,
             &[
-                &market_id_i64,
+                &market_address,
                 &query.from,
                 &query.to,
                 &interval.pg_interval(),
@@ -682,17 +718,30 @@ async fn get_candles(
     for row in rows {
         let bucket: DateTime<Utc> = row.get("bucket");
         let bucket_s = bucket.timestamp();
-        let open: Option<Decimal> = row.get("open");
-        let close: Option<Decimal> = row.get("close");
+        let open: Option<Decimal> = row
+            .try_get("open")
+            .map_err(|error| ApiError::internal(error.into()))?;
+        let close: Option<Decimal> = row
+            .try_get("close")
+            .map_err(|error| ApiError::internal(error.into()))?;
 
         let (open, high, low, close) = match (open, close) {
             (Some(open), Some(close)) => {
-                let high: Decimal = row.get::<_, Option<Decimal>>("high").unwrap_or(close);
-                let low: Decimal = row.get::<_, Option<Decimal>>("low").unwrap_or(close);
+                let high: Decimal = row
+                    .try_get::<_, Option<Decimal>>("high")
+                    .map_err(|error| ApiError::internal(error.into()))?
+                    .unwrap_or(close);
+                let low: Decimal = row
+                    .try_get::<_, Option<Decimal>>("low")
+                    .map_err(|error| ApiError::internal(error.into()))?
+                    .unwrap_or(close);
                 (open, high, low, close)
             }
             // Empty bucket: carry the last known close forward as a flat candle.
-            _ => match row.get::<_, Option<Decimal>>("carried_close") {
+            _ => match row
+                .try_get::<_, Option<Decimal>>("carried_close")
+                .map_err(|error| ApiError::internal(error.into()))?
+            {
                 Some(carried) => (carried, carried, carried, carried),
                 None => continue, // No data at or before this bucket yet.
             },
@@ -704,8 +753,8 @@ async fn get_candles(
             || !is_valid_chart_price(close)
         {
             eprintln!(
-                "Dropping invalid candle row for market_id={}: time={} open={} high={} low={} close={}",
-                market_id, bucket_s, open, high, low, close
+                "Dropping invalid candle row for market_address={}: time={} open={} high={} low={} close={}",
+                market_address, bucket_s, open, high, low, close
             );
             continue;
         }
@@ -723,7 +772,7 @@ async fn get_candles(
     }
 
     Ok(Json(CandleResponse {
-        market_id,
+        market_address,
         interval: interval.as_str().to_string(),
         from: query.from.to_rfc3339_opts(SecondsFormat::Secs, true),
         to: query.to.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -734,9 +783,10 @@ async fn get_candles(
 
 async fn get_market_history(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
     Query(query): Query<MarketHistoryQuery>,
 ) -> Result<Json<MarketHistoryResponse>, ApiError> {
+    validate_market_address(&market_address)?;
     if query.start_slot > query.end_slot {
         return Err(ApiError::bad_request(
             "'start_slot' must be less than or equal to 'end_slot'",
@@ -753,7 +803,7 @@ async fn get_market_history(
     let rows = query_market_history_rows(
         &state.pool,
         &state.config.market_updates_table,
-        market_id,
+        market_address.clone(),
         query.start_slot,
         query.end_slot,
         max_rows,
@@ -767,7 +817,7 @@ async fn get_market_history(
     }
 
     Ok(Json(MarketHistoryResponse {
-        market_id,
+        market_address,
         start_slot: query.start_slot,
         end_slot: query.end_slot,
         points: items.len(),
@@ -777,9 +827,10 @@ async fn get_market_history(
 
 async fn get_market_updates(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
     Query(query): Query<MarketUpdatesQuery>,
 ) -> Result<Json<MarketUpdatesResponse>, ApiError> {
+    validate_market_address(&market_address)?;
     let limit = query.limit.unwrap_or(DEFAULT_UPDATES_LIMIT);
     if limit == 0 || limit > ABSOLUTE_MAX_UPDATES_LIMIT {
         return Err(ApiError::bad_request(format!(
@@ -790,7 +841,7 @@ async fn get_market_updates(
     let mut rows = query_market_updates_rows(
         &state.pool,
         &state.config.market_updates_table,
-        market_id,
+        market_address.clone(),
         query.before_slot,
         limit.saturating_add(1),
     )
@@ -808,7 +859,7 @@ async fn get_market_updates(
     }
 
     Ok(Json(MarketUpdatesResponse {
-        market_id,
+        market_address,
         before_slot: query.before_slot,
         has_more,
         limit,
@@ -819,9 +870,10 @@ async fn get_market_updates(
 
 async fn get_closed_position_mini_chart(
     State(state): State<Arc<AppState>>,
-    Path(market_id): Path<u64>,
+    Path(market_address): Path<String>,
     Query(query): Query<ClosedPositionMiniChartQuery>,
 ) -> Result<Json<ClosedPositionMiniChartResponse>, ApiError> {
+    validate_market_address(&market_address)?;
     if query.start_slot > query.end_slot {
         return Err(ApiError::bad_request(
             "'start_slot' must be less than or equal to 'end_slot'",
@@ -840,7 +892,7 @@ async fn get_closed_position_mini_chart(
     let rows = query_closed_position_mini_chart_rows(
         &state.pool,
         &state.config.market_updates_table,
-        market_id,
+        market_address.clone(),
         query.start_slot,
         query.end_slot,
         max_points,
@@ -862,7 +914,7 @@ async fn get_closed_position_mini_chart(
     }
 
     Ok(Json(ClosedPositionMiniChartResponse {
-        market_id,
+        market_address,
         start_slot: query.start_slot,
         end_slot: query.end_slot,
         points: items.len(),
@@ -873,10 +925,8 @@ async fn get_closed_position_mini_chart(
 async fn fetch_latest_price_snapshot(
     pool: &Pool,
     market_updates_table: &str,
-    market_id: u64,
+    market_address: String,
 ) -> Result<Option<LatestPriceResponse>> {
-    let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
-
     let sql = format!(
         "SELECT \
             r.slot AS slot, \
@@ -884,8 +934,8 @@ async fn fetch_latest_price_snapshot(
             (r.quote_flow::numeric * power(10::numeric, mc.base_decimals::numeric)) \
               / (r.base_flow::numeric * power(10::numeric, mc.quote_decimals::numeric)) AS price \
          FROM {} r \
-         JOIN market_configs mc ON mc.market_id = r.market_id \
-         WHERE r.market_id = $1 \
+         JOIN v1_market_configs mc ON mc.market_address = r.market_address \
+         WHERE r.market_address = $1 \
            AND r.base_flow <> 0 \
            AND mc.base_decimals IS NOT NULL \
            AND mc.quote_decimals IS NOT NULL \
@@ -897,7 +947,7 @@ async fn fetch_latest_price_snapshot(
 
     let client = pool.get().await.context("Failed to get DB connection")?;
     let maybe_row = client
-        .query_opt(&sql, &[&market_id_i64])
+        .query_opt(&sql, &[&market_address])
         .await
         .context("Failed to query latest price")?;
 
@@ -907,11 +957,13 @@ async fn fetch_latest_price_snapshot(
 
     let slot: i64 = row.get("slot");
     let event_time_ms: i64 = row.get("event_time_ms");
-    let price: Decimal = row.get("price");
+    let price: Decimal = row
+        .try_get("price")
+        .context("Price exceeds supported decimal range")?;
 
     if !is_valid_chart_price(price) {
         return Err(anyhow!(
-            "Latest price out of supported range for market_id={market_id}: {price}"
+            "Latest price out of supported range for market_address={market_address}: {price}"
         ));
     }
 
@@ -919,7 +971,7 @@ async fn fetch_latest_price_snapshot(
         .ok_or_else(|| anyhow!("Invalid event_time_ms {event_time_ms}"))?;
 
     Ok(Some(LatestPriceResponse {
-        market_id,
+        market_address,
         slot: slot.max(0) as u64,
         event_time: event_time.to_rfc3339_opts(SecondsFormat::Millis, true),
         event_time_ms,
@@ -930,7 +982,7 @@ async fn fetch_latest_price_snapshot(
 async fn query_market_history_rows(
     pool: &Pool,
     market_updates_table: &str,
-    market_id: u64,
+    market_address: String,
     start_slot: u64,
     end_slot: u64,
     max_rows: usize,
@@ -939,17 +991,16 @@ async fn query_market_history_rows(
         return Ok(Vec::new());
     }
 
-    let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
     let start_slot_i64 = i64::try_from(start_slot).context("start_slot out of range")?;
     let end_slot_i64 = i64::try_from(end_slot).context("end_slot out of range")?;
 
     let client = pool.get().await.context("Failed to get DB connection")?;
 
     let anchor_sql = format!(
-        "SELECT event_uid, signature, event_index, slot, market_id, base_flow, quote_flow, \
+        "SELECT event_uid, signature, event_index, slot, market_address, base_flow::text AS base_flow, quote_flow::text AS quote_flow, \
             (extract(epoch from event_time) * 1000)::bigint AS event_time_ms \
          FROM {} \
-         WHERE market_id = $1 \
+         WHERE market_address = $1 \
            AND slot < $2 \
            AND event_uid NOT LIKE 'debug:%' \
          ORDER BY slot DESC, event_index DESC \
@@ -958,7 +1009,7 @@ async fn query_market_history_rows(
     );
 
     let mut anchor_rows: Vec<MarketHistoryRow> = client
-        .query(&anchor_sql, &[&market_id_i64, &start_slot_i64])
+        .query(&anchor_sql, &[&market_address, &start_slot_i64])
         .await
         .context("Failed to query market history anchor row")?
         .iter()
@@ -972,10 +1023,10 @@ async fn query_market_history_rows(
     }
 
     let range_sql = format!(
-        "SELECT event_uid, signature, event_index, slot, market_id, base_flow, quote_flow, \
+        "SELECT event_uid, signature, event_index, slot, market_address, base_flow::text AS base_flow, quote_flow::text AS quote_flow, \
             (extract(epoch from event_time) * 1000)::bigint AS event_time_ms \
          FROM {} \
-         WHERE market_id = $1 \
+         WHERE market_address = $1 \
            AND slot >= $2 \
            AND slot <= $3 \
            AND event_uid NOT LIKE 'debug:%' \
@@ -988,7 +1039,12 @@ async fn query_market_history_rows(
     let mut range_rows: Vec<MarketHistoryRow> = client
         .query(
             &range_sql,
-            &[&market_id_i64, &start_slot_i64, &end_slot_i64, &range_limit],
+            &[
+                &market_address,
+                &start_slot_i64,
+                &end_slot_i64,
+                &range_limit,
+            ],
         )
         .await
         .context("Failed to query market history range rows")?
@@ -998,8 +1054,8 @@ async fn query_market_history_rows(
 
     if range_rows.len() > remaining_capacity {
         return Err(anyhow!(
-            "Requested history range for market_id={} exceeds max_rows={} rows",
-            market_id,
+            "Requested history range for market_address={} exceeds max_rows={} rows",
+            market_address,
             max_rows
         ));
     }
@@ -1016,7 +1072,7 @@ async fn query_market_history_rows(
 async fn query_market_updates_rows(
     pool: &Pool,
     market_updates_table: &str,
-    market_id: u64,
+    market_address: String,
     before_slot: Option<u64>,
     limit: usize,
 ) -> Result<Vec<MarketHistoryRow>> {
@@ -1024,12 +1080,11 @@ async fn query_market_updates_rows(
         return Ok(Vec::new());
     }
 
-    let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
     let limit_i64 = limit as i64;
 
     let client = pool.get().await.context("Failed to get DB connection")?;
 
-    const SELECT_COLUMNS: &str = "SELECT event_uid, signature, event_index, slot, market_id, base_flow, quote_flow, \
+    const SELECT_COLUMNS: &str = "SELECT event_uid, signature, event_index, slot, market_address, base_flow::text AS base_flow, quote_flow::text AS quote_flow, \
             (extract(epoch from event_time) * 1000)::bigint AS event_time_ms";
 
     let pg_rows = match before_slot {
@@ -1037,27 +1092,27 @@ async fn query_market_updates_rows(
             let before_slot_i64 = i64::try_from(before_slot).context("before_slot out of range")?;
             let sql = format!(
                 "{SELECT_COLUMNS} FROM {market_updates_table} \
-                 WHERE market_id = $1 \
+                 WHERE market_address = $1 \
                    AND slot < $2 \
                    AND event_uid NOT LIKE 'debug:%' \
                  ORDER BY event_time DESC, slot DESC, event_index DESC \
                  LIMIT $3"
             );
             client
-                .query(&sql, &[&market_id_i64, &before_slot_i64, &limit_i64])
+                .query(&sql, &[&market_address, &before_slot_i64, &limit_i64])
                 .await
                 .context("Failed to query market updates rows")?
         }
         None => {
             let sql = format!(
                 "{SELECT_COLUMNS} FROM {market_updates_table} \
-                 WHERE market_id = $1 \
+                 WHERE market_address = $1 \
                    AND event_uid NOT LIKE 'debug:%' \
                  ORDER BY event_time DESC, slot DESC, event_index DESC \
                  LIMIT $2"
             );
             client
-                .query(&sql, &[&market_id_i64, &limit_i64])
+                .query(&sql, &[&market_address, &limit_i64])
                 .await
                 .context("Failed to query market updates rows")?
         }
@@ -1069,7 +1124,7 @@ async fn query_market_updates_rows(
 async fn query_closed_position_mini_chart_rows(
     pool: &Pool,
     market_updates_table: &str,
-    market_id: u64,
+    market_address: String,
     start_slot: u64,
     end_slot: u64,
     max_points: usize,
@@ -1078,7 +1133,6 @@ async fn query_closed_position_mini_chart_rows(
         return Ok(Vec::new());
     }
 
-    let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
     let start_slot_i64 = i64::try_from(start_slot).context("start_slot out of range")?;
     let end_slot_i64 = i64::try_from(end_slot).context("end_slot out of range")?;
 
@@ -1094,8 +1148,8 @@ async fn query_closed_position_mini_chart_rows(
     let anchor_sql = format!(
         "SELECT r.slot AS slot, {price_expr} AS price \
          FROM {market_updates_table} r \
-         JOIN market_configs mc ON mc.market_id = r.market_id \
-         WHERE r.market_id = $1 \
+         JOIN v1_market_configs mc ON mc.market_address = r.market_address \
+         WHERE r.market_address = $1 \
            AND r.base_flow <> 0 \
            AND r.slot < $2 \
            AND mc.base_decimals IS NOT NULL \
@@ -1106,12 +1160,17 @@ async fn query_closed_position_mini_chart_rows(
     );
 
     let mut results: Vec<(i64, Decimal)> = client
-        .query(&anchor_sql, &[&market_id_i64, &start_slot_i64])
+        .query(&anchor_sql, &[&market_address, &start_slot_i64])
         .await
         .context("Failed to query closed-position mini chart anchor row")?
         .iter()
-        .map(|row| (row.get::<_, i64>("slot"), row.get::<_, Decimal>("price")))
-        .collect();
+        .map(|row| {
+            Ok((
+                row.get::<_, i64>("slot"),
+                row.try_get::<_, Decimal>("price")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, tokio_postgres::Error>>()?;
 
     let sampled_sql = format!(
         "SELECT DISTINCT ON (bucket) slot, price FROM ( \
@@ -1121,8 +1180,8 @@ async fn query_closed_position_mini_chart_rows(
                 (r.slot - $2) / $3 AS bucket, \
                 {price_expr} AS price \
             FROM {market_updates_table} r \
-            JOIN market_configs mc ON mc.market_id = r.market_id \
-            WHERE r.market_id = $1 \
+            JOIN v1_market_configs mc ON mc.market_address = r.market_address \
+            WHERE r.market_address = $1 \
               AND r.base_flow <> 0 \
               AND r.slot >= $2 \
               AND r.slot <= $4 \
@@ -1139,7 +1198,7 @@ async fn query_closed_position_mini_chart_rows(
         .query(
             &sampled_sql,
             &[
-                &market_id_i64,
+                &market_address,
                 &start_slot_i64,
                 &bucket_size,
                 &end_slot_i64,
@@ -1149,8 +1208,13 @@ async fn query_closed_position_mini_chart_rows(
         .await
         .context("Failed to query closed-position mini chart sampled rows")?
         .iter()
-        .map(|row| (row.get::<_, i64>("slot"), row.get::<_, Decimal>("price")))
-        .collect();
+        .map(|row| {
+            Ok((
+                row.get::<_, i64>("slot"),
+                row.try_get::<_, Decimal>("price")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, tokio_postgres::Error>>()?;
 
     if results.is_empty() {
         return Ok(sampled);
@@ -1168,7 +1232,7 @@ fn market_history_row_from_pg(row: &tokio_postgres::Row) -> MarketHistoryRow {
         signature: row.get("signature"),
         event_index: row.get("event_index"),
         slot: row.get("slot"),
-        market_id: row.get("market_id"),
+        market_address: row.get("market_address"),
         base_flow: row.get("base_flow"),
         quote_flow: row.get("quote_flow"),
         event_time_ms: row.get("event_time_ms"),
@@ -1204,30 +1268,32 @@ fn market_history_item_from_row(row: MarketHistoryRow) -> Result<MarketHistoryIt
         signature: row.signature,
         event_index,
         slot: row.slot.max(0) as u64,
-        market_id: row.market_id.max(0) as u64,
+        market_address: row.market_address,
         base_flow: row.base_flow.to_string(),
         quote_flow: row.quote_flow.to_string(),
         created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
     })
 }
 
-async fn query_market_configs(pool: &Pool, market_id: Option<u64>) -> Result<Vec<MarketConfig>> {
-    const SELECT_COLUMNS: &str = "SELECT market_id, base_mint, quote_mint, base_decimals, \
-        quote_decimals, base_ticker, quote_ticker FROM market_configs";
+async fn query_market_configs(
+    pool: &Pool,
+    market_address: Option<String>,
+) -> Result<Vec<MarketConfig>> {
+    const SELECT_COLUMNS: &str = "SELECT market_address, base_mint, quote_mint, base_decimals, \
+        quote_decimals, base_ticker, quote_ticker FROM v1_market_configs";
 
     let client = pool.get().await.context("Failed to get DB connection")?;
 
-    let pg_rows = match market_id {
-        Some(market_id) => {
-            let market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
-            let sql = format!("{SELECT_COLUMNS} WHERE market_id = $1");
+    let pg_rows = match market_address {
+        Some(market_address) => {
+            let sql = format!("{SELECT_COLUMNS} WHERE market_address = $1");
             client
-                .query(&sql, &[&market_id_i64])
+                .query(&sql, &[&market_address])
                 .await
                 .context("Failed to query market config")?
         }
         None => {
-            let sql = format!("{SELECT_COLUMNS} ORDER BY market_id ASC");
+            let sql = format!("{SELECT_COLUMNS} ORDER BY market_address ASC");
             client
                 .query(&sql, &[])
                 .await
@@ -1238,9 +1304,9 @@ async fn query_market_configs(pool: &Pool, market_id: Option<u64>) -> Result<Vec
     pg_rows
         .iter()
         .map(|row| {
-            let market_id: i64 = row.get("market_id");
+            let market_address: String = row.get("market_address");
             Ok(MarketConfig {
-                market_id: u64::try_from(market_id).context("market_id out of range")?,
+                market_address,
                 base_mint: row.get("base_mint"),
                 quote_mint: row.get("quote_mint"),
                 base_decimals: row.get("base_decimals"),
@@ -1256,7 +1322,7 @@ async fn query_closed_position_rows(
     pool: &Pool,
     close_position_events_table: &str,
     authority: &str,
-    market_id: Option<u64>,
+    market_address: Option<String>,
     before_slot: Option<u64>,
     limit: usize,
 ) -> Result<Vec<ClosedPositionRow>> {
@@ -1268,8 +1334,8 @@ async fn query_closed_position_rows(
     let client = pool.get().await.context("Failed to get DB connection")?;
 
     let select_columns = format!(
-        "SELECT signature, event_index, slot, market_id, start_slot, \
-        end_slot, deposit_amount, swapped_amount, remaining_amount, fee_amount, is_buy, \
+        "SELECT position_address, base_receiver, quote_receiver, signature, event_index, slot, market_address, start_slot, \
+        end_slot, deposit_amount::text AS deposit_amount, swapped_amount::text AS swapped_amount, remaining_amount::text AS remaining_amount, fee_amount::text AS fee_amount, is_buy, \
         (extract(epoch from event_time) * 1000)::bigint AS event_time_ms \
         FROM {close_position_events_table}"
     );
@@ -1279,11 +1345,9 @@ async fn query_closed_position_rows(
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&authority];
     let mut predicates = String::from("WHERE position_authority = $1");
 
-    let market_id_i64;
-    if let Some(market_id) = market_id {
-        market_id_i64 = i64::try_from(market_id).context("market_id out of range")?;
-        params.push(&market_id_i64);
-        predicates.push_str(&format!(" AND market_id = ${}", params.len()));
+    if let Some(ref market_address) = market_address {
+        params.push(market_address);
+        predicates.push_str(&format!(" AND market_address = ${}", params.len()));
     }
 
     let before_slot_i64;
@@ -1309,10 +1373,13 @@ async fn query_closed_position_rows(
     Ok(pg_rows
         .iter()
         .map(|row| ClosedPositionRow {
+            position_address: row.get("position_address"),
+            base_receiver: row.get("base_receiver"),
+            quote_receiver: row.get("quote_receiver"),
             signature: row.get("signature"),
             event_index: row.get("event_index"),
             slot: row.get("slot"),
-            market_id: row.get("market_id"),
+            market_address: row.get("market_address"),
             start_slot: row.get("start_slot"),
             end_slot: row.get("end_slot"),
             deposit_amount: row.get("deposit_amount"),
@@ -1326,13 +1393,14 @@ async fn query_closed_position_rows(
 }
 
 fn closed_position_item_from_row(row: ClosedPositionRow) -> Result<ClosedPositionItem, ApiError> {
-    let event_time = DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
-        ApiError::internal(anyhow!(
-            "Invalid event_time_ms {} for signature={}",
-            row.event_time_ms,
-            row.signature
-        ))
-    })?;
+    let event_time =
+        DateTime::<Utc>::from_timestamp_millis(row.event_time_ms).ok_or_else(|| {
+            ApiError::internal(anyhow!(
+                "Invalid event_time_ms {} for signature={}",
+                row.event_time_ms,
+                row.signature
+            ))
+        })?;
 
     let event_index = u16::try_from(row.event_index).map_err(|_| {
         ApiError::internal(anyhow!(
@@ -1343,10 +1411,13 @@ fn closed_position_item_from_row(row: ClosedPositionRow) -> Result<ClosedPositio
     })?;
 
     Ok(ClosedPositionItem {
+        position_address: row.position_address,
+        base_receiver: row.base_receiver,
+        quote_receiver: row.quote_receiver,
         signature: row.signature,
         event_index,
         slot: row.slot.max(0) as u64,
-        market_id: row.market_id.max(0) as u64,
+        market_address: row.market_address,
         start_slot: row.start_slot.max(0) as u64,
         end_slot: row.end_slot.max(0) as u64,
         deposit_amount: row.deposit_amount.to_string(),
@@ -1370,16 +1441,16 @@ impl MarketPriceStreams {
         }
     }
 
-    async fn subscribe(&self, market_id: u64) -> broadcast::Receiver<LatestPriceResponse> {
+    async fn subscribe(&self, market_address: String) -> broadcast::Receiver<LatestPriceResponse> {
         {
             let channels = self.channels.read().await;
-            if let Some(sender) = channels.get(&market_id) {
+            if let Some(sender) = channels.get(&market_address) {
                 return sender.subscribe();
             }
         }
 
         let mut channels = self.channels.write().await;
-        if let Some(sender) = channels.get(&market_id) {
+        if let Some(sender) = channels.get(&market_address) {
             return sender.subscribe();
         }
 
@@ -1387,18 +1458,19 @@ impl MarketPriceStreams {
         let runtime = self.runtime.clone();
         let sender_for_task = sender.clone();
         let poll_interval = self.poll_interval;
+        let stream_market = market_address.clone();
         tokio::spawn(async move {
-            run_market_price_stream(runtime, market_id, sender_for_task, poll_interval).await;
+            run_market_price_stream(runtime, stream_market, sender_for_task, poll_interval).await;
         });
 
-        channels.insert(market_id, sender.clone());
+        channels.insert(market_address, sender.clone());
         sender.subscribe()
     }
 }
 
 async fn run_market_price_stream(
     runtime: PriceStreamRuntime,
-    market_id: u64,
+    market_address: String,
     sender: broadcast::Sender<LatestPriceResponse>,
     poll_interval: Duration,
 ) {
@@ -1407,8 +1479,12 @@ async fn run_market_price_stream(
     let mut latest_snapshot_key: Option<(i64, u64)> = None;
 
     loop {
-        match fetch_latest_price_snapshot(&runtime.pool, &runtime.market_updates_table, market_id)
-            .await
+        match fetch_latest_price_snapshot(
+            &runtime.pool,
+            &runtime.market_updates_table,
+            market_address.clone(),
+        )
+        .await
         {
             Ok(Some(snapshot)) => {
                 let snapshot_key = (snapshot.event_time_ms, snapshot.slot);
@@ -1423,8 +1499,8 @@ async fn run_market_price_stream(
             Ok(None) => {}
             Err(error) => {
                 eprintln!(
-                    "Price stream polling error for market_id={}: {:#}",
-                    market_id, error
+                    "Price stream polling error for market_address={}: {:#}",
+                    market_address, error
                 );
             }
         }
@@ -1453,6 +1529,13 @@ fn parse_u64_env(key: &str, default_value: u64) -> Result<u64> {
         Err(env::VarError::NotPresent) => Ok(default_value),
         Err(error) => Err(anyhow!("Failed to read {key}: {error}")),
     }
+}
+
+fn validate_market_address(value: &str) -> Result<(), ApiError> {
+    value
+        .parse::<anchor_lang::prelude::Pubkey>()
+        .map(|_| ())
+        .map_err(|_| ApiError::bad_request("market_address must be a valid Solana public key"))
 }
 
 fn resolve_bind_addr() -> Result<String> {
@@ -1511,5 +1594,58 @@ fn is_valid_chart_price(value: Decimal) -> bool {
                 && float_value.abs() <= MAX_LIGHTWEIGHT_CHART_ABS_VALUE
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_preserves_u128_flows_as_decimal_strings() {
+        let address = twob_keepers::program_id().to_string();
+        let item = market_history_item_from_row(MarketHistoryRow {
+            event_uid: "update:sig:0".into(),
+            signature: "sig".into(),
+            event_index: 0,
+            slot: 1,
+            market_address: address.clone(),
+            base_flow: u128::MAX.to_string(),
+            quote_flow: (1u128 << 100).to_string(),
+            event_time_ms: 0,
+        })
+        .unwrap();
+        let json = serde_json::to_value(item).unwrap();
+        assert_eq!(json["market_address"], address);
+        assert_eq!(json["base_flow"], u128::MAX.to_string());
+        assert!(json.get("market_id").is_none());
+        assert!(validate_market_address(&address).is_ok());
+        assert!(validate_market_address("1").is_err());
+    }
+
+    #[test]
+    fn closed_positions_keep_receivers_and_unsigned_amounts() {
+        let item = closed_position_item_from_row(ClosedPositionRow {
+            position_address: "position".into(),
+            base_receiver: "base-receiver".into(),
+            quote_receiver: "quote-receiver".into(),
+            signature: "sig".into(),
+            event_index: 0,
+            slot: 100,
+            market_address: "market".into(),
+            start_slot: 1,
+            end_slot: 100,
+            deposit_amount: u64::MAX.to_string(),
+            swapped_amount: u64::MAX.to_string(),
+            remaining_amount: "0".into(),
+            fee_amount: "0".into(),
+            is_buy: false,
+            event_time_ms: 0,
+        })
+        .unwrap();
+        assert_eq!(item.deposit_amount, u64::MAX.to_string());
+        assert_eq!(item.base_receiver, "base-receiver");
+        assert_eq!(item.quote_receiver, "quote-receiver");
+        assert!(!item.is_buy);
     }
 }

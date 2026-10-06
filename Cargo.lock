@@ -5891,6 +5891,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "bytemuck",
  "chrono",
  "deadpool-postgres",
  "dotenv",

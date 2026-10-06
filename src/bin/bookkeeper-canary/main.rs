@@ -2,7 +2,7 @@ use anchor_client::solana_sdk::{
     account::Account as SolanaAccount, commitment_config::CommitmentConfig, hash::Hash,
     pubkey::Pubkey,
 };
-use anchor_lang::{AccountDeserialize, declare_program};
+use anchor_lang::{Discriminator, ZeroCopy};
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
@@ -32,14 +32,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpListener, time::sleep};
-use twob_keepers::{ARRAY_LENGTH, AccountResolver};
+use twob_keepers::{ARRAY_LENGTH, END_SLOT_INTERVAL, TWOB_PROGRAM_ID, market_address_from_env};
 
-declare_program!(twob_anchor);
-use twob_anchor::accounts::{Bookkeeping, Market};
+use twob_anchor::accounts::Market;
+use twob_keepers::twob_anchor;
 
-const DEFAULT_PROGRAM_ID: &str = "CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5";
+const DEFAULT_PROGRAM_ID: &str = TWOB_PROGRAM_ID;
 const DEFAULT_MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
-const DEFAULT_MARKET_ID: u64 = 1;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 10_000;
 const DEFAULT_STALE_AFTER_MS: u64 = 45_000;
 const WARNING_NUMERATOR: u64 = 7;
@@ -52,7 +51,7 @@ struct CanaryConfig {
     cluster: String,
     program_id: Pubkey,
     expected_genesis_hash: Hash,
-    market_id: u64,
+    market_address: Pubkey,
     poll_interval: Duration,
     stale_after: Duration,
 }
@@ -89,7 +88,7 @@ struct CanaryHealthResponse {
     status: CanaryHealthStatus,
     cluster: String,
     program_id: String,
-    market_id: u64,
+    market_address: String,
     current_slot: Option<u64>,
     last_update_slot: Option<u64>,
     lag_slots: Option<u64>,
@@ -182,7 +181,7 @@ impl CanaryConfig {
                 .unwrap_or_else(|| DEFAULT_MAINNET_GENESIS_HASH.to_string()),
         )
         .context("BOOKKEEPER_CANARY_EXPECTED_GENESIS_HASH must be a valid Solana hash")?;
-        let market_id = parse_u64_env("BOOKKEEPER_CANARY_MARKET_ID", DEFAULT_MARKET_ID)?;
+        let market_address = market_address_from_env("BOOKKEEPER_CANARY_MARKET_ADDRESS")?;
         let poll_interval_ms = parse_u64_env(
             "BOOKKEEPER_CANARY_POLL_INTERVAL_MS",
             DEFAULT_POLL_INTERVAL_MS,
@@ -206,7 +205,7 @@ impl CanaryConfig {
             cluster,
             program_id,
             expected_genesis_hash,
-            market_id,
+            market_address,
             poll_interval: Duration::from_millis(poll_interval_ms),
             stale_after: Duration::from_millis(stale_after_ms),
         })
@@ -228,8 +227,8 @@ impl CanaryMonitoring {
                     Cow::Owned(config.expected_genesis_hash.to_string()),
                 ),
                 (
-                    Cow::Borrowed("market_id"),
-                    Cow::Owned(config.market_id.to_string()),
+                    Cow::Borrowed("market_address"),
+                    Cow::Owned(config.market_address.to_string()),
                 ),
             ]
             .into_iter(),
@@ -336,7 +335,7 @@ impl CanaryMonitoring {
                 status,
                 cluster: self.config.cluster.clone(),
                 program_id: self.config.program_id.to_string(),
-                market_id: self.config.market_id,
+                market_address: self.config.market_address.to_string(),
                 current_slot: health.current_slot,
                 last_update_slot: health.last_update_slot,
                 lag_slots: health.lag_slots,
@@ -451,32 +450,19 @@ async fn poll_chain(
     config: CanaryConfig,
     monitoring: CanaryMonitoring,
 ) -> Result<()> {
-    let resolver = AccountResolver::new(config.program_id);
-    let market_address = resolver.market_pda(config.market_id).address();
-    let bookkeeping_address = resolver.bookkeeping_pda(&market_address).address();
-
+    let market_address = config.market_address;
     println!(
-        "Bookkeeper canary started cluster={} program_id={} market_id={} market={} bookkeeping={} poll_interval={}s",
+        "Bookkeeper canary started cluster={} program_id={} market={} poll_interval={}s",
         config.cluster,
         config.program_id,
-        config.market_id,
         market_address,
-        bookkeeping_address,
         config.poll_interval.as_secs_f64(),
     );
 
     let mut logged_first_success = false;
     loop {
         let started_at = Instant::now();
-        match observe_chain(
-            &rpc,
-            config.program_id,
-            config.market_id,
-            market_address,
-            bookkeeping_address,
-        )
-        .await
-        {
+        match observe_chain(&rpc, config.program_id, market_address).await {
             Ok(observation) => {
                 if !logged_first_success {
                     println!(
@@ -506,46 +492,19 @@ async fn poll_chain(
 async fn observe_chain(
     rpc: &RpcClient,
     program_id: Pubkey,
-    market_id: u64,
     market_address: Pubkey,
-    bookkeeping_address: Pubkey,
 ) -> Result<ChainObservation> {
-    let accounts = rpc
-        .get_multiple_accounts(&[market_address, bookkeeping_address])
+    let account = rpc
+        .get_account(&market_address)
         .await
-        .context("getMultipleAccounts RPC failed")?;
-    let mut accounts = accounts.into_iter();
-    let market = decode_program_account::<Market>(
-        accounts.next().flatten(),
-        market_address,
-        program_id,
-        "market",
-    )?;
-    let bookkeeping = decode_program_account::<Bookkeeping>(
-        accounts.next().flatten(),
-        bookkeeping_address,
-        program_id,
-        "bookkeeping",
-    )?;
-    if market.id != market_id {
-        return Err(anyhow!(
-            "market account id mismatch: expected {market_id}, observed {}",
-            market.id
-        ));
-    }
-    let freshness_boundary_slots = market
-        .end_slot_interval
-        .checked_mul(ARRAY_LENGTH)
-        .context("freshness boundary overflow")?;
-    if freshness_boundary_slots == 0 {
-        return Err(anyhow!("freshness boundary must be greater than zero"));
-    }
+        .context("getAccount RPC failed")?;
+    let market =
+        decode_program_account::<Market>(Some(account), market_address, program_id, "market")?;
     let current_slot = rpc.get_slot().await.context("getSlot RPC failed")?;
-
     Ok(ChainObservation {
         current_slot,
-        last_update_slot: bookkeeping.last_update_slot,
-        freshness_boundary_slots,
+        last_update_slot: market.bookkeeping.last_update_slot,
+        freshness_boundary_slots: END_SLOT_INTERVAL * ARRAY_LENGTH,
     })
 }
 
@@ -563,7 +522,7 @@ async fn validate_cluster(rpc: &RpcClient, expected_genesis_hash: Hash) -> Resul
     Ok(())
 }
 
-fn decode_program_account<T: AccountDeserialize>(
+fn decode_program_account<T: ZeroCopy + Discriminator>(
     account: Option<SolanaAccount>,
     address: Pubkey,
     expected_owner: Pubkey,
@@ -582,8 +541,7 @@ fn decode_program_account<T: AccountDeserialize>(
             account.data.len()
         ));
     }
-    let mut data = account.data.as_slice();
-    T::try_deserialize(&mut data).with_context(|| {
+    twob_keepers::accounts::decode_account_data::<T>(&account.data).with_context(|| {
         format!("invalid {account_name} discriminator or account data at {address}")
     })
 }
@@ -668,7 +626,7 @@ mod tests {
             cluster: "mainnet".to_string(),
             program_id: Pubkey::from_str(DEFAULT_PROGRAM_ID).unwrap(),
             expected_genesis_hash: Hash::from_str(DEFAULT_MAINNET_GENESIS_HASH).unwrap(),
-            market_id: 1,
+            market_address: Pubkey::new_unique(),
             poll_interval: Duration::from_secs(10),
             stale_after: Duration::from_secs(45),
         }
@@ -706,13 +664,9 @@ mod tests {
             rent_epoch: 0,
         };
 
-        let error = decode_program_account::<Bookkeeping>(
-            Some(account),
-            address,
-            expected_owner,
-            "bookkeeping",
-        )
-        .unwrap_err();
+        let error =
+            decode_program_account::<Market>(Some(account), address, expected_owner, "market")
+                .unwrap_err();
 
         assert!(error.to_string().contains("has owner"));
     }
@@ -732,7 +686,7 @@ mod tests {
 
         assert!(encoded.contains("bookkeeper_chain_lag_slots"));
         assert!(encoded.contains("cluster=\"mainnet\""));
-        assert!(encoded.contains("market_id=\"1\""));
+        assert!(encoded.contains("market_address="));
         assert!(!encoded.contains("twob_bookkeeper"));
     }
 }

@@ -17,16 +17,14 @@ use solana_rpc_client_types::config::{RpcSendTransactionConfig, RpcSimulateTrans
 use solana_transaction_status_client_types::TransactionStatus;
 use std::{env, future::Future, net::SocketAddr, sync::Arc, time::Instant};
 use twob_keepers::{
-    ARRAY_LENGTH, AccountResolver,
+    ARRAY_LENGTH, AccountResolver, END_SLOT_INTERVAL, market_address_from_env,
     monitoring::{BookkeeperMonitoring, MonitoringConfig},
 };
 
 use tokio::time::{Duration, sleep};
 
-declare_program!(twob_anchor);
-use twob_anchor::{accounts::Bookkeeping, client::accounts, client::args};
-
-use crate::twob_anchor::accounts::Market;
+use twob_anchor::{client::accounts, client::args};
+use twob_keepers::twob_anchor;
 
 const DEFAULT_ESTIMATED_SLOT_DURATION_MS: u64 = 401;
 const DEFAULT_MIN_UPDATE_DELAY_MS: u64 = 1_000;
@@ -153,12 +151,10 @@ impl TransactionRpc for RpcClient {
 async fn main() -> Result<()> {
     dotenv::dotenv().ok();
 
-    let market_id: u64 = env::var("MARKET_ID")
-        .expect("MARKET_ID must be set")
-        .parse()
-        .expect("MARKET_ID must be a valid u64");
+    let market_address = market_address_from_env("MARKET_ADDRESS")?;
     let config = BookkeeperConfig::from_env()?;
-    let monitoring = BookkeeperMonitoring::new(monitoring_config(market_id, config)?);
+    let monitoring =
+        BookkeeperMonitoring::new(monitoring_config(market_address.to_string(), config)?);
     let mut monitoring_server = tokio::spawn(monitoring.clone().serve());
 
     let payer_bytes: Vec<u8> =
@@ -178,29 +174,22 @@ async fn main() -> Result<()> {
     let rpc = program.rpc();
     let resolver = AccountResolver::new(twob_anchor::ID);
 
-    let market_pda = resolver.market_pda(market_id);
-    let bookkeeping_pda = resolver.bookkeeping_pda(&market_pda.address());
-
-    let market_account =
-        retry_until_success("fetch market account", config.retry_backoff, || async {
-            monitoring
-                .observe_rpc(
-                    "get_market_account",
-                    program.account::<Market>(market_pda.address()),
-                )
-                .await
-                .context("failed to fetch market account")
-        })
-        .await;
-    let end_slot_interval = market_account.end_slot_interval;
-    if end_slot_interval == 0 {
-        return Err(anyhow!("market end_slot_interval must be greater than 0"));
-    }
+    retry_until_success("fetch market account", config.retry_backoff, || async {
+        monitoring
+            .observe_rpc(
+                "get_market_account",
+                twob_keepers::accounts::fetch_market(&rpc, &market_address),
+            )
+            .await
+            .context("failed to fetch market account")
+    })
+    .await;
+    let end_slot_interval = END_SLOT_INTERVAL;
     monitoring.configure_freshness_boundary(end_slot_interval, ARRAY_LENGTH)?;
 
     println!(
-        "Bookkeeper started for market_id={} slots_between_updates={} blockhash_attempts={} rebroadcast_interval={}s priority_fee_percentile={} priority_fee_range={}..{} micro_lamports compute_unit_range={}..{} min_update_delay={}s retry_backoff={}s..{}s",
-        market_id,
+        "Bookkeeper started for market_address={} slots_between_updates={} blockhash_attempts={} rebroadcast_interval={}s priority_fee_percentile={} priority_fee_range={}..{} micro_lamports compute_unit_range={}..{} min_update_delay={}s retry_backoff={}s..{}s",
+        market_address,
         config.slots_between_updates,
         config.send_retry_attempts,
         seconds(config.rebroadcast_interval),
@@ -238,11 +227,11 @@ async fn main() -> Result<()> {
             let bookkeeping_account = monitoring
                 .observe_rpc(
                     "get_bookkeeping_account",
-                    program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                    twob_keepers::accounts::fetch_market(&rpc, &market_address),
                 )
                 .await
                 .context("failed to fetch bookkeeping account")?;
-            let last_update_slot = bookkeeping_account.last_update_slot;
+            let last_update_slot = bookkeeping_account.bookkeeping.last_update_slot;
             let current_slot = monitoring
                 .observe_rpc("get_slot", rpc.get_slot())
                 .await
@@ -264,24 +253,16 @@ async fn main() -> Result<()> {
                     )
                 })?;
 
-                let reference_exits_pda =
-                    resolver.exits_pda(&market_pda.address(), reference_index);
-                let previous_exits_pda = resolver.exits_pda(&market_pda.address(), previous_index);
-                let reference_prices_pda =
-                    resolver.prices_pda(&market_pda.address(), reference_index);
-                let previous_prices_pda =
-                    resolver.prices_pda(&market_pda.address(), previous_index);
+                let current_interval = resolver.market_interval_pda(&market_address, reference_index).address();
+                let previous_interval = resolver.market_interval_pda(&market_address, previous_index).address();
 
                 let bookkeeping_ix = program
                     .request()
                     .accounts(accounts::UpdateBooks {
                         signer: payer.pubkey(),
-                        market: market_pda.address(),
-                        bookkeeping: bookkeeping_pda.address(),
-                        reference_exits: reference_exits_pda.address(),
-                        previous_exits: previous_exits_pda.address(),
-                        reference_prices: reference_prices_pda.address(),
-                        previous_prices: previous_prices_pda.address(),
+                        market: market_address,
+                        current_interval,
+                        previous_interval,
                         system_program: system_program::ID,
                     })
                     .args(args::UpdateBooks {
@@ -297,27 +278,24 @@ async fn main() -> Result<()> {
                 let refreshed_bookkeeping = monitoring
                     .observe_rpc(
                         "recheck_bookkeeping_before_signing",
-                        program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                        twob_keepers::accounts::fetch_market(&rpc, &market_address),
                     )
                     .await
                     .context("failed to recheck bookkeeping account before signing")?;
-                if refreshed_bookkeeping.last_update_slot >= reference_slot {
+                if refreshed_bookkeeping.bookkeeping.last_update_slot >= reference_slot {
                     monitoring.record_transaction("avoided_noop");
                     println!(
                         "Skipping update_books because target was already reached before signing reference_slot={} observed_last_update_slot={} outcome=avoided_no_op",
-                        reference_slot, refreshed_bookkeeping.last_update_slot
+                        reference_slot, refreshed_bookkeeping.bookkeeping.last_update_slot
                     );
                     return Ok(config.min_update_delay);
                 }
 
                 let writable_accounts = [
                     payer.pubkey(),
-                    market_pda.address(),
-                    bookkeeping_pda.address(),
-                    reference_exits_pda.address(),
-                    previous_exits_pda.address(),
-                    reference_prices_pda.address(),
-                    previous_prices_pda.address(),
+                    market_address,
+                    current_interval,
+                    previous_interval,
                 ];
 
                 for blockhash_attempt in 1..=config.send_retry_attempts {
@@ -325,15 +303,15 @@ async fn main() -> Result<()> {
                         let latest_bookkeeping = monitoring
                             .observe_rpc(
                                 "recheck_bookkeeping_after_expiry",
-                                program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                                twob_keepers::accounts::fetch_market(&rpc, &market_address),
                             )
                             .await
                             .context("failed to recheck bookkeeping after blockhash expiry")?;
-                        if latest_bookkeeping.last_update_slot >= reference_slot {
+                        if latest_bookkeeping.bookkeeping.last_update_slot >= reference_slot {
                             monitoring.record_transaction("avoided_noop");
                             println!(
                                 "Skipping replacement update_books because target was reached while the previous blockhash expired reference_slot={} observed_last_update_slot={} outcome=avoided_no_op",
-                                reference_slot, latest_bookkeeping.last_update_slot
+                                reference_slot, latest_bookkeeping.bookkeeping.last_update_slot
                             );
                             return Ok(config.min_update_delay);
                         }
@@ -443,11 +421,11 @@ async fn main() -> Result<()> {
                             match monitoring
                                 .observe_rpc(
                                     "get_bookkeeping_after_confirmation",
-                                    program.account::<Bookkeeping>(bookkeeping_pda.address()),
+                                    twob_keepers::accounts::fetch_market(&rpc, &market_address),
                                 )
                                 .await
                             {
-                                Ok(after) if after.last_update_slot >= reference_slot => {
+                                Ok(after) if after.bookkeeping.last_update_slot >= reference_slot => {
                                     println!(
                                         "update_books confirmed signature={} reference_slot={} confirmed_slot={} broadcast_attempts={} landing_ms={} observed_last_update_slot={} outcome=target_reached",
                                         signature,
@@ -455,7 +433,7 @@ async fn main() -> Result<()> {
                                         confirmed_slot,
                                         broadcast_attempts,
                                         elapsed.as_millis(),
-                                        after.last_update_slot,
+                                        after.bookkeeping.last_update_slot,
                                     );
                                 }
                                 Ok(after) => {
@@ -465,7 +443,7 @@ async fn main() -> Result<()> {
                                         signature,
                                         reference_slot,
                                         confirmed_slot,
-                                        after.last_update_slot,
+                                        after.bookkeeping.last_update_slot,
                                     );
                                 }
                                 Err(error) => {
@@ -692,7 +670,7 @@ impl BookkeeperConfig {
     }
 }
 
-fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<MonitoringConfig> {
+fn monitoring_config(market_address: String, config: BookkeeperConfig) -> Result<MonitoringConfig> {
     let bind_addr = match env::var("BOOKKEEPER_MONITOR_BIND_ADDR") {
         Ok(raw) if !raw.trim().is_empty() => raw
             .parse::<SocketAddr>()
@@ -711,7 +689,12 @@ fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<Monitor
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| env::var("RAILWAY_SERVICE_NAME").ok())
-        .unwrap_or_else(|| format!("market-{market_id}-{}-slots", config.slots_between_updates));
+        .unwrap_or_else(|| {
+            format!(
+                "market-{market_address}-{}-slots",
+                config.slots_between_updates
+            )
+        });
     let cluster = env::var("BOOKKEEPER_CLUSTER")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -730,7 +713,7 @@ fn monitoring_config(market_id: u64, config: BookkeeperConfig) -> Result<Monitor
         bind_addr,
         bookkeeper_id,
         cluster,
-        market_id,
+        market_address,
         slots_between_updates: config.slots_between_updates,
         activity_grace: Duration::from_millis(activity_grace_ms),
     })
@@ -1138,7 +1121,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             bookkeeper_id: "test".to_string(),
             cluster: "test".to_string(),
-            market_id: 1,
+            market_address: "market-test".to_string(),
             slots_between_updates: 40,
             activity_grace: Duration::from_secs(15),
         })
