@@ -1,5 +1,5 @@
 use anchor_client::solana_sdk::commitment_config::CommitmentConfig;
-use anchor_lang::{AnchorDeserialize, Discriminator, prelude::*};
+use anchor_lang::{AnchorDeserialize, Discriminator};
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
@@ -20,8 +20,8 @@ use twob_keepers::{
     TimescaleSink,
 };
 
-declare_program!(twob_anchor);
 use twob_anchor::events::*;
+use twob_keepers::twob_anchor;
 
 const PROGRAM_LOG_PREFIX: &str = "Program log: ";
 const PROGRAM_DATA_PREFIX: &str = "Program data: ";
@@ -210,6 +210,10 @@ async fn handle_logs_notification(
     notification: RpcResponse<RpcLogsResponse>,
     stats: &mut IngestStats,
 ) -> anyhow::Result<()> {
+    // Logs can contain events emitted before a later instruction rolled back.
+    if notification.value.err.is_some() {
+        return Ok(());
+    }
     let slot = notification.context.slot;
     let signature = notification.value.signature;
 
@@ -224,7 +228,7 @@ async fn handle_logs_notification(
             KeeperEvent::MarketUpdate(event) => {
                 println!(
                     "MarketUpdateEvent - Signature: {}, Slot: {}, Market: {}",
-                    signature, slot, event.market_id
+                    signature, slot, event.market
                 );
                 stats.record_market_event();
 
@@ -232,7 +236,7 @@ async fn handle_logs_notification(
                     signature: signature.clone(),
                     event_index: indexed_event.event_index,
                     slot,
-                    market_id: event.market_id,
+                    market_address: event.market.to_string(),
                     base_flow: event.base_flow,
                     quote_flow: event.quote_flow,
                 };
@@ -245,7 +249,7 @@ async fn handle_logs_notification(
             KeeperEvent::ClosePosition(event) => {
                 println!(
                     "ClosePositionEvent - Signature: {}, Slot: {}, Market: {}",
-                    signature, slot, event.market_id
+                    signature, slot, event.market
                 );
                 stats.record_close_event();
 
@@ -253,15 +257,18 @@ async fn handle_logs_notification(
                     signature: signature.clone(),
                     event_index: indexed_event.event_index,
                     slot,
+                    position_address: event.position_address.to_string(),
                     position_authority: event.position_authority.to_string(),
-                    market_id: event.market_id,
+                    base_receiver: event.base_receiver.to_string(),
+                    quote_receiver: event.quote_receiver.to_string(),
+                    market_address: event.market.to_string(),
                     start_slot: event.start_slot,
                     end_slot: event.end_slot,
                     deposit_amount: event.deposit_amount,
                     swapped_amount: event.swapped_amount,
                     remaining_amount: event.remaining_amount,
                     fee_amount: event.fee_amount,
-                    is_buy: event.is_buy,
+                    is_buy: u8::from(matches!(event.side, twob_anchor::types::Side::Buy)),
                 };
 
                 if let Err(error) = sink.insert_close_position_event(record).await {
@@ -330,6 +337,9 @@ fn parse_events_from_logs(
                 let event_index = events.len() as u16;
                 events.push(IndexedKeeperEvent { event_index, event });
             }
+            Ok(None)
+                if log_bytes.starts_with(TradeFeeCollectedEvent::DISCRIMINATOR)
+                    || log_bytes.starts_with(AuthorityTransferred::DISCRIMINATOR) => {}
             Ok(None) => stats.record_unknown_discriminator(&log_bytes),
             Err(error) => stats.record_decode_error(signature, slot, &error),
         }
@@ -413,4 +423,142 @@ fn optional_u64_as_string(value: Option<u64>) -> String {
     value
         .map(|inner| inner.to_string())
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::{AnchorSerialize, prelude::Pubkey};
+    use std::sync::Mutex;
+    use twob_keepers::sink::SinkFuture;
+
+    #[derive(Default)]
+    struct MemorySink {
+        updates: Mutex<Vec<MarketUpdateEventRecord>>,
+        closes: Mutex<Vec<ClosePositionEventRecord>>,
+    }
+    impl EventSink for MemorySink {
+        fn sink_name(&self) -> &'static str {
+            "memory"
+        }
+        fn insert_market_update_event(&self, event: MarketUpdateEventRecord) -> SinkFuture<'_> {
+            self.updates.lock().unwrap().push(event);
+            Box::pin(async { Ok(()) })
+        }
+        fn insert_close_position_event(&self, event: ClosePositionEventRecord) -> SinkFuture<'_> {
+            self.closes.lock().unwrap().push(event);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn event_log<T: AnchorSerialize + Discriminator>(event: &T) -> String {
+        let mut bytes = T::DISCRIMINATOR.to_vec();
+        event.serialize(&mut bytes).unwrap();
+        format!("Program data: {}", STANDARD.encode(bytes))
+    }
+
+    #[tokio::test]
+    async fn v1_events_preserve_market_receivers_and_full_unsigned_amounts() {
+        let sink = MemorySink::default();
+        let market = Pubkey::new_unique();
+        let receiver = Pubkey::new_unique();
+        let position = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+        let update = MarketUpdateEvent {
+            market,
+            base_flow: u128::MAX,
+            quote_flow: 1u128 << 100,
+        };
+        let close = ClosePositionEvent {
+            market,
+            position_address: position,
+            position_authority: authority,
+            base_receiver: receiver,
+            quote_receiver: receiver,
+            deposit_amount: u64::MAX,
+            swapped_amount: u64::MAX - 1,
+            remaining_amount: 0,
+            fee_amount: 1,
+            start_slot: 100,
+            end_slot: 200,
+            side: twob_anchor::types::Side::Buy,
+        };
+        let program = twob_anchor::ID.to_string();
+        let logs = vec![
+            format!("Program {program} invoke [1]"),
+            event_log(&update),
+            event_log(&close),
+            format!("Program {program} success"),
+        ];
+        let notification = RpcResponse {
+            context: solana_rpc_client_types::response::RpcResponseContext {
+                slot: 200,
+                api_version: None,
+            },
+            value: RpcLogsResponse {
+                signature: "signature".into(),
+                err: None,
+                logs,
+            },
+        };
+        let mut stats = IngestStats::new();
+        handle_logs_notification(&sink, &program, notification.clone(), &mut stats)
+            .await
+            .unwrap();
+        {
+            let updates = sink.updates.lock().unwrap();
+            assert_eq!(updates[0].market_address, market.to_string());
+            assert_eq!(updates[0].base_flow, u128::MAX);
+            assert_eq!(updates[0].quote_flow, 1u128 << 100);
+            let closes = sink.closes.lock().unwrap();
+            assert_eq!(closes[0].event_index, 1);
+            assert_eq!(closes[0].position_address, position.to_string());
+            assert_eq!(closes[0].position_authority, authority.to_string());
+            assert_eq!(closes[0].base_receiver, receiver.to_string());
+            assert_eq!(closes[0].quote_receiver, receiver.to_string());
+            assert_eq!(closes[0].deposit_amount, u64::MAX);
+            assert_eq!(closes[0].is_buy, 1);
+        }
+        let mut failed = notification;
+        failed.value.err =
+            Some(anchor_client::solana_sdk::transaction::TransactionError::AccountNotFound);
+        handle_logs_notification(&sink, &program, failed, &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(sink.updates.lock().unwrap().len(), 1);
+        assert_eq!(sink.closes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn event_parser_ignores_other_programs_and_known_unstored_v1_events() {
+        let program = twob_anchor::ID.to_string();
+        let event = MarketUpdateEvent {
+            market: Pubkey::new_unique(),
+            base_flow: 1,
+            quote_flow: 2,
+        };
+        let fee = TradeFeeCollectedEvent {
+            market: event.market,
+            position: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            total_fee: 10,
+            maker_fee: 4,
+            protocol_fee: 6,
+        };
+        let logs = vec![
+            format!("Program {program} invoke [1]"),
+            "Program other invoke [2]".into(),
+            event_log(&event),
+            "Program other success".into(),
+            event_log(&fee),
+            event_log(&event),
+            format!("Program {program} success"),
+        ];
+        let mut stats = IngestStats::new();
+        let events = parse_events_from_logs(&program, &logs, "sig", 10, &mut stats);
+        assert_eq!(events.len(), 1);
+        assert!(stats.unknown_discriminators.is_empty());
+        assert_eq!(stats.decode_errors, 0);
+        assert!(decode_event(MarketUpdateEvent::DISCRIMINATOR).is_err());
+    }
 }

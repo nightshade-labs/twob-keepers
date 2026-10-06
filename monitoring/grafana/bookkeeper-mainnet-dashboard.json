@@ -38,7 +38,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Independent mainnet slot lag. Warning starts at 49 slots and critical at 70 slots.",
+      "description": "Independent mainnet slot lag. Warning starts at 124 slots and critical at 176 slots.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -57,11 +57,11 @@
               },
               {
                 "color": "orange",
-                "value": 49
+                "value": 124
               },
               {
                 "color": "red",
-                "value": 70
+                "value": 176
               }
             ]
           },
@@ -101,7 +101,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "max(bookkeeper_chain_lag_slots{cluster=\"mainnet\", market_id=\"1\"})",
+          "expr": "max(bookkeeper_chain_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"})",
           "instant": true,
           "legendFormat": "Chain lag",
           "range": false,
@@ -116,7 +116,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "Slots remaining before the 70-slot critical freshness boundary.",
+      "description": "Slots remaining before the 176-slot critical freshness boundary.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -124,7 +124,7 @@
           },
           "decimals": 0,
           "mappings": [],
-          "max": 70,
+          "max": 176,
           "min": 0,
           "thresholds": {
             "mode": "absolute",
@@ -179,7 +179,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "min(bookkeeper_chain_freshness_remaining_slots{cluster=\"mainnet\", market_id=\"1\"})",
+          "expr": "min(bookkeeper_chain_freshness_remaining_slots{cluster=\"mainnet\", market_address=\"$market_address\"})",
           "instant": true,
           "legendFormat": "Remaining",
           "range": false,
@@ -424,7 +424,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "time() - max(bookkeeper_chain_last_observation_timestamp_seconds{cluster=\"mainnet\", market_id=\"1\"})",
+          "expr": "time() - max(bookkeeper_chain_last_observation_timestamp_seconds{cluster=\"mainnet\", market_address=\"$market_address\"})",
           "instant": true,
           "legendFormat": "Age",
           "range": false,
@@ -488,11 +488,11 @@
               },
               {
                 "color": "orange",
-                "value": 49
+                "value": 124
               },
               {
                 "color": "red",
-                "value": 70
+                "value": 176
               }
             ]
           },
@@ -530,7 +530,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_chain_lag_slots{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "bookkeeper_chain_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "chain canary",
           "range": true,
           "refId": "A"
@@ -541,7 +541,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_lag_slots{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "bookkeeper_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "{{instance}}",
           "range": true,
           "refId": "B"
@@ -552,7 +552,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_chain_warning_lag_slots{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "bookkeeper_chain_warning_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "warning",
           "range": true,
           "refId": "C"
@@ -563,7 +563,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_chain_critical_lag_slots{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "bookkeeper_chain_critical_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "critical",
           "range": true,
           "refId": "D"
@@ -710,11 +710,11 @@
               },
               {
                 "color": "orange",
-                "value": 49
+                "value": 124
               },
               {
                 "color": "red",
-                "value": 70
+                "value": 176
               }
             ]
           },
@@ -752,7 +752,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_lag_slots{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "bookkeeper_lag_slots{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "{{instance}} ({{slots_between_updates}} slots)",
           "range": true,
           "refId": "A"
@@ -856,7 +856,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "time() - bookkeeper_last_chain_observation_timestamp_seconds{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "time() - bookkeeper_last_chain_observation_timestamp_seconds{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "{{instance}}",
           "range": true,
           "refId": "A"
@@ -867,7 +867,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster=\"mainnet\", market_id=\"1\"}",
+          "expr": "time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster=\"mainnet\", market_address=\"$market_address\"}",
           "legendFormat": "chain canary",
           "range": true,
           "refId": "B"
@@ -933,7 +933,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "bookkeeper_payer_balance_lamports{cluster=\"mainnet\", market_id=\"1\"} / 1e9",
+          "expr": "bookkeeper_payer_balance_lamports{cluster=\"mainnet\", market_address=\"$market_address\"} / 1e9",
           "legendFormat": "{{instance}}",
           "range": true,
           "refId": "A"
@@ -1019,7 +1019,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, outcome) (increase(bookkeeper_transactions_total{cluster=\"mainnet\", market_id=\"1\"}[1h]))",
+          "expr": "sum by (instance, outcome) (increase(bookkeeper_transactions_total{cluster=\"mainnet\", market_address=\"$market_address\"}[1h]))",
           "legendFormat": "{{instance}} {{outcome}}",
           "range": true,
           "refId": "A"
@@ -1105,7 +1105,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, operation) (increase(bookkeeper_rpc_requests_total{cluster=\"mainnet\", market_id=\"1\", outcome=\"failure\"}[15m]))",
+          "expr": "sum by (instance, operation) (increase(bookkeeper_rpc_requests_total{cluster=\"mainnet\", market_address=\"$market_address\", outcome=\"failure\"}[15m]))",
           "legendFormat": "{{instance}} {{operation}}",
           "range": true,
           "refId": "A"
@@ -1192,7 +1192,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, instance, operation) (rate(bookkeeper_rpc_duration_seconds_bucket{cluster=\"mainnet\", market_id=\"1\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, instance, operation) (rate(bookkeeper_rpc_duration_seconds_bucket{cluster=\"mainnet\", market_address=\"$market_address\"}[5m])))",
           "legendFormat": "{{instance}} {{operation}}",
           "range": true,
           "refId": "A"
@@ -1278,7 +1278,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(bookkeeper_confirmation_duration_seconds_bucket{cluster=\"mainnet\", market_id=\"1\"}[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(bookkeeper_confirmation_duration_seconds_bucket{cluster=\"mainnet\", market_address=\"$market_address\"}[15m])))",
           "legendFormat": "{{instance}}",
           "range": true,
           "refId": "A"
@@ -1364,7 +1364,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (increase(bookkeeper_chain_observations_total{cluster=\"mainnet\", market_id=\"1\"}[15m]))",
+          "expr": "sum by (outcome) (increase(bookkeeper_chain_observations_total{cluster=\"mainnet\", market_address=\"$market_address\"}[15m]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"
@@ -1382,7 +1382,21 @@
     "market-1"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "market_address",
+        "label": "Market address",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(bookkeeper_chain_lag_slots{cluster=\"mainnet\"}, market_address)",
+        "refresh": 1,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
   },
   "time": {
     "from": "now-6h",
@@ -1398,7 +1412,7 @@
     ]
   },
   "timezone": "browser",
-  "title": "Bookkeeper Mainnet — Market 1",
+  "title": "Bookkeeper Mainnet \u2014 Market 1",
   "uid": "bookkeeper-mainnet-market-1",
   "version": 1,
   "weekStart": ""

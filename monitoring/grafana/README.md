@@ -1,9 +1,11 @@
 # Grafana Cloud dashboard
 
 `bookkeeper-mainnet-dashboard.json` is an importable Grafana dashboard for
-mainnet market 1. It covers independent chain freshness, both redundant
+the selected mainnet v1 market. It covers independent chain freshness, both redundant
 bookkeepers, scrape availability, payer balance, transaction outcomes, RPC
 failures, and latency.
+
+Choose a market using the **Market address** dashboard variable.
 
 ## Import
 
@@ -15,7 +17,7 @@ failures, and latency.
 5. Keep the dashboard UID `bookkeeper-mainnet-market-1` and click **Import**.
 
 The dashboard refreshes every 10 seconds and defaults to the last six hours.
-Warning and critical visual thresholds are 49 and 70 slots. Alert rules are
+Warning and critical visual thresholds are 124 and 176 slots. Alert rules are
 configured separately so dashboard edits do not accidentally change paging.
 
 ## Expected targets

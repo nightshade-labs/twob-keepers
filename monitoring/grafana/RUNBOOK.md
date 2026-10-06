@@ -1,7 +1,7 @@
 # Bookkeeper monitoring runbook
 
-This runbook covers mainnet market 1 for program
-`CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5`.
+This runbook covers the configured mainnet v1 market for program
+`TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A`.
 
 For the system topology and the relationship between the two workers, canary,
 Alloy, Grafana Cloud, and Telegram, see
@@ -36,15 +36,15 @@ mainnet-market-1-chain
 
 ## Freshness boundaries
 
-The canary derives the critical boundary from the on-chain market account as
-`end_slot_interval * ARRAY_LENGTH`. For mainnet market 1:
+The canary derives the critical boundary from the v1 protocol constants as
+`END_SLOT_INTERVAL * ARRAY_LENGTH`. For the configured mainnet v1 market:
 
 ```text
-Informational warning boundary: 49 slots
-Critical boundary:             70 slots
+Informational warning boundary: 124 slots
+Critical boundary:             176 slots
 ```
 
-The 49-slot boundary is shown on the dashboard but does not send a freshness
+The 124-slot boundary is shown on the dashboard but does not send a freshness
 notification. Freshness notifications are critical-only.
 
 ## Alert routing
@@ -61,7 +61,7 @@ point. All production rules use these labels:
 ```text
 service=bookkeeper
 environment=mainnet
-market_id=1
+market_address=<market-address>
 ```
 
 Rules use the `bookkeeper-mainnet` evaluation group with a 10-second interval.
@@ -70,17 +70,17 @@ Rules use the `bookkeeper-mainnet` evaluation group with a 10-second interval.
 
 ### Bookkeeper freshness critical
 
-Fires immediately when the independent chain lag reaches the dynamic on-chain
-critical boundary, currently 70 slots.
+Fires immediately when the independent chain lag reaches the protocol
+critical boundary, currently 176 slots.
 
 ```promql
-max(bookkeeper_chain_lag_slots{cluster="mainnet", market_id="1"})
+max(bookkeeper_chain_lag_slots{cluster="mainnet", market_address="<market-address>"})
 ```
 
 Compared with:
 
 ```promql
-max(bookkeeper_chain_critical_lag_slots{cluster="mainnet", market_id="1"})
+max(bookkeeper_chain_critical_lag_slots{cluster="mainnet", market_address="<market-address>"})
 ```
 
 Configuration:
@@ -103,7 +103,7 @@ Grafana data-source failures.
 time() - max(
   bookkeeper_chain_last_observation_timestamp_seconds{
     cluster="mainnet",
-    market_id="1"
+    market_address="<market-address>"
   }
 )
 ```
@@ -135,7 +135,7 @@ sum(
     time() -
     bookkeeper_next_expected_activity_timestamp_seconds{
       cluster="mainnet",
-      market_id="1"
+      market_address="<market-address>"
     } <= bool 15
   )
 ) or vector(0)
@@ -161,7 +161,7 @@ Fires when the lowest reported payer balance is below 0.2 SOL but not below
 min(
   bookkeeper_payer_balance_lamports{
     cluster="mainnet",
-    market_id="1"
+    market_address="<market-address>"
   } / 1e9
 )
 ```
@@ -196,11 +196,11 @@ take approximately five minutes to appear and resolve an alert.
 Start every incident with the independent chain state:
 
 ```promql
-bookkeeper_chain_lag_slots{cluster="mainnet", market_id="1"}
-bookkeeper_chain_freshness_remaining_slots{cluster="mainnet", market_id="1"}
+bookkeeper_chain_lag_slots{cluster="mainnet", market_address="<market-address>"}
+bookkeeper_chain_freshness_remaining_slots{cluster="mainnet", market_address="<market-address>"}
 time() - bookkeeper_chain_last_observation_timestamp_seconds{
   cluster="mainnet",
-  market_id="1"
+  market_address="<market-address>"
 }
 ```
 
@@ -214,12 +214,12 @@ up{job="bookkeeper-canary"}
 Check worker progress and balances:
 
 ```promql
-bookkeeper_lag_slots{cluster="mainnet", market_id="1"}
+bookkeeper_lag_slots{cluster="mainnet", market_address="<market-address>"}
 time() - bookkeeper_next_expected_activity_timestamp_seconds{
   cluster="mainnet",
-  market_id="1"
+  market_address="<market-address>"
 }
-bookkeeper_payer_balance_lamports{cluster="mainnet", market_id="1"} / 1e9
+bookkeeper_payer_balance_lamports{cluster="mainnet", market_address="<market-address>"} / 1e9
 ```
 
 Check recent failures and transaction outcomes:
@@ -228,7 +228,7 @@ Check recent failures and transaction outcomes:
 sum by (instance, operation) (
   increase(bookkeeper_rpc_requests_total{
     cluster="mainnet",
-    market_id="1",
+    market_address="<market-address>",
     outcome="failure"
   }[15m])
 )
@@ -236,7 +236,7 @@ sum by (instance, operation) (
 sum by (instance, outcome) (
   increase(bookkeeper_transactions_total{
     cluster="mainnet",
-    market_id="1"
+    market_address="<market-address>"
   }[1h])
 )
 ```
@@ -251,7 +251,7 @@ sum by (instance, outcome) (
    latest logs.
 3. Check payer balance and RPC failures.
 4. Restart only an unhealthy replica. Never restart both bookkeepers at once.
-5. Confirm `bookkeeper_chain_lag_slots` falls below 70 after a transaction is
+5. Confirm `bookkeeper_chain_lag_slots` falls below 176 after a transaction is
    confirmed.
 6. If both workers are healthy but transactions repeatedly fail, inspect the
    on-chain error, payer funding, RPC health, priority fees, and compute-unit

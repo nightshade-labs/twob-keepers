@@ -1,16 +1,15 @@
 # Bookkeeper chain canary
 
 The `bookkeeper-canary` is a read-only service that independently observes the
-mainnet market and bookkeeping accounts. It does not load a payer keypair, sign
+mainnet market account with embedded bookkeeping. It does not load a payer keypair, sign
 transactions, or submit anything to Solana.
 
-For mainnet market 1 it verifies:
+For the configured mainnet market address it verifies:
 
 - the RPC reports the mainnet genesis hash;
-- the market and bookkeeping PDAs exist and are owned by the configured program;
-- both accounts have valid Anchor discriminators and can be decoded;
-- the decoded market ID is 1;
-- the freshness boundary can be computed from the on-chain market account.
+- the market account exists and is owned by the configured program;
+- the account has the v1 Anchor discriminator and complete zero-copy layout;
+- embedded bookkeeping can be decoded, with a protocol freshness boundary of 176 slots.
 
 ## Create the Railway service
 
@@ -29,8 +28,8 @@ BIN_NAME=bookkeeper-canary
 PORT=8080
 BOOKKEEPER_CANARY_RPC_URL=<independent-mainnet-rpc-url>
 BOOKKEEPER_CANARY_CLUSTER=mainnet
-BOOKKEEPER_CANARY_PROGRAM_ID=CCAmAqvza37EWzou7LoYCaGKzdJsCu1CLPMp3Wvx3Bc5
-BOOKKEEPER_CANARY_MARKET_ID=1
+BOOKKEEPER_CANARY_PROGRAM_ID=TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A
+BOOKKEEPER_CANARY_MARKET_ADDRESS=<market-address>
 BOOKKEEPER_CANARY_EXPECTED_GENESIS_HASH=5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d
 BOOKKEEPER_CANARY_POLL_INTERVAL_MS=10000
 BOOKKEEPER_CANARY_STALE_AFTER_MS=45000
@@ -63,14 +62,14 @@ contains the canary scrape target. Then verify these queries in Grafana Explore:
 
 ```promql
 up{job="bookkeeper-canary"}
-bookkeeper_chain_lag_slots{cluster="mainnet", market_id="1"}
-bookkeeper_chain_warning_lag_slots{cluster="mainnet", market_id="1"}
-bookkeeper_chain_critical_lag_slots{cluster="mainnet", market_id="1"}
-time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster="mainnet", market_id="1"}
+bookkeeper_chain_lag_slots{cluster="mainnet", market_address="<market-address>"}
+bookkeeper_chain_warning_lag_slots{cluster="mainnet", market_address="<market-address>"}
+bookkeeper_chain_critical_lag_slots{cluster="mainnet", market_address="<market-address>"}
+time() - bookkeeper_chain_last_observation_timestamp_seconds{cluster="mainnet", market_address="<market-address>"}
 ```
 
-Expected values are one `up` series with value `1`, a warning threshold of 49,
-and a critical threshold of 70. The lag changes as transactions land and slots
+Expected values are one `up` series with value `1`, a warning threshold of 124,
+and a critical threshold of 176. The lag changes as transactions land and slots
 advance.
 
 ## Exposed endpoints

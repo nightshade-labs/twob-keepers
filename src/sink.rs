@@ -13,9 +13,9 @@ pub struct MarketUpdateEventRecord {
     pub signature: String,
     pub event_index: u16,
     pub slot: u64,
-    pub market_id: u64,
-    pub base_flow: u64,
-    pub quote_flow: u64,
+    pub market_address: String,
+    pub base_flow: u128,
+    pub quote_flow: u128,
 }
 
 impl MarketUpdateEventRecord {
@@ -33,8 +33,11 @@ pub struct ClosePositionEventRecord {
     pub signature: String,
     pub event_index: u16,
     pub slot: u64,
+    pub position_address: String,
     pub position_authority: String,
-    pub market_id: u64,
+    pub base_receiver: String,
+    pub quote_receiver: String,
+    pub market_address: String,
     pub start_slot: u64,
     pub end_slot: u64,
     pub deposit_amount: u64,

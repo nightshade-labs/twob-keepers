@@ -34,7 +34,7 @@ pub struct MonitoringConfig {
     pub bind_addr: SocketAddr,
     pub bookkeeper_id: String,
     pub cluster: String,
-    pub market_id: u64,
+    pub market_address: String,
     pub slots_between_updates: u64,
     pub activity_grace: Duration,
 }
@@ -92,7 +92,7 @@ pub struct HealthResponse {
     status: HealthStatus,
     bookkeeper_id: String,
     cluster: String,
-    market_id: u64,
+    market_address: String,
     slots_between_updates: u64,
     current_slot: Option<u64>,
     last_update_slot: Option<u64>,
@@ -144,8 +144,8 @@ impl BookkeeperMonitoring {
                 ),
                 (Cow::Borrowed("cluster"), Cow::Owned(config.cluster.clone())),
                 (
-                    Cow::Borrowed("market_id"),
-                    Cow::Owned(config.market_id.to_string()),
+                    Cow::Borrowed("market_address"),
+                    Cow::Owned(config.market_address.to_string()),
                 ),
                 (
                     Cow::Borrowed("slots_between_updates"),
@@ -383,7 +383,7 @@ impl BookkeeperMonitoring {
                 status,
                 bookkeeper_id: self.config.bookkeeper_id.clone(),
                 cluster: self.config.cluster.clone(),
-                market_id: self.config.market_id,
+                market_address: self.config.market_address.clone(),
                 slots_between_updates: self.config.slots_between_updates,
                 current_slot: health.current_slot,
                 last_update_slot: health.last_update_slot,
@@ -597,7 +597,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             bookkeeper_id: "primary".to_string(),
             cluster: "mainnet".to_string(),
-            market_id: 1,
+            market_address: "market-test".to_string(),
             slots_between_updates,
             activity_grace: Duration::from_secs(15),
         })
@@ -606,12 +606,14 @@ mod tests {
     #[test]
     fn mainnet_thresholds_are_warning_at_seventy_percent_and_critical_at_boundary() {
         let monitoring = monitoring(40);
-        monitoring.configure_freshness_boundary(7, 10).unwrap();
+        monitoring
+            .configure_freshness_boundary(crate::END_SLOT_INTERVAL, crate::ARRAY_LENGTH)
+            .unwrap();
         let (health, _) = monitoring.health_response();
 
-        assert_eq!(health.freshness_boundary_slots, Some(70));
-        assert_eq!(health.warning_lag_slots, Some(49));
-        assert_eq!(health.critical_lag_slots, Some(70));
+        assert_eq!(health.freshness_boundary_slots, Some(176));
+        assert_eq!(health.warning_lag_slots, Some(124));
+        assert_eq!(health.critical_lag_slots, Some(176));
     }
 
     #[test]

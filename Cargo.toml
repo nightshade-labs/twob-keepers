@@ -11,6 +11,7 @@ anchor-spl = "0.32.1"
 anyhow = "1.0.93"
 axum = { version = "0.8.1", features = ["json", "macros"] }
 base64 = "0.22.1"
+bytemuck = { version = "1.24", features = ["derive", "min_const_generics"] }
 chrono = { version = "0.4.38", features = ["serde"] }
 deadpool-postgres = "0.14"
 dotenv = "0.15.0"
