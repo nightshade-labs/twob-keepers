@@ -13,7 +13,7 @@ read API for market data consumers.
 | `bookkeeper-canary` | Independently reads the mainnet market account with embedded bookkeeping and exports chain-level freshness metrics without holding a payer or sending transactions. |
 | `event-keeper` | Subscribes to Solana transaction logs, decodes TwoB Anchor events, and writes market updates and close-position events to Tiger Cloud (TimescaleDB), recomputing 1-minute candles on every market update. |
 | `read-api` | Serves HTTP endpoints for market configs, latest price, price streams, candles, market history, recent updates, closed-position mini charts, and per-wallet closed positions. |
-| `trade-keeper` | Closes ended trade positions and abandoned paused positions for `MARKET_ADDRESS`, using the stored receivers and each mint's token program. |
+| `trade-keeper` | Schedules and batches ended/abandoned position closures for `MARKET_ADDRESS`, discovers changes over WebSocket, and skips missing receiving token accounts. |
 | `liquidity-keeper` | Placeholder binary. |
 
 The shared library exports PDA resolution helpers, event sink abstractions, and
@@ -60,6 +60,15 @@ SLOTS_BETWEEN_UPDATES=40
 ```
 
 `PAYER_KEYPAIR` is expected to be a JSON array of keypair bytes.
+
+The trade keeper uses a filtered position subscription and a local deadline queue
+instead of repeatedly scanning all positions. It normally waits five seconds after
+an estimated deadline to combine closures, validates due positions and receiving
+accounts in bulk, and packs multiple closes into each transaction where they fit.
+Missing receiving accounts are deferred for five minutes; the keeper never
+creates a user's token account. A five-minute reconciliation scan also recovers
+missed subscription updates. See [trade keeper operation and tuning](docs/trade-keeper.md)
+for the RPC budget, native SOL handling, and failure recovery.
 
 The bookkeeper supports staggered active redundancy. Give every replica a
 unique `BOOKKEEPER_ID` and use different update cadences so one normally reaches
@@ -211,6 +220,12 @@ Run the read-only chain canary:
 cargo run --bin bookkeeper-canary
 ```
 
+Run the trade keeper alongside a bookkeeper for the same market:
+
+```bash
+cargo run --bin trade-keeper
+```
+
 Run the event ingester:
 
 ```bash
@@ -263,6 +278,7 @@ The Dockerfile builds one binary at a time using the `BIN_NAME` build argument:
 ```bash
 docker build --build-arg BIN_NAME=bookkeeper -t twob-bookkeeper .
 docker build --build-arg BIN_NAME=bookkeeper-canary -t bookkeeper-canary .
+docker build --build-arg BIN_NAME=trade-keeper -t twob-trade-keeper .
 docker build --build-arg BIN_NAME=event-keeper -t twob-event-keeper .
 docker build --build-arg BIN_NAME=read-api -t twob-read-api .
 ```
