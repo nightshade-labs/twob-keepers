@@ -1,185 +1,236 @@
-use anchor_client::{
-    Client, Cluster,
-    solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair, signer::Signer},
-};
-use anchor_lang::{Discriminator, prelude::*};
-use anchor_spl::{associated_token::spl_associated_token_account, token::spl_token};
-use anyhow::{Context, ensure};
-use solana_rpc_client_types::{
-    config::RpcProgramAccountsConfig,
-    filter::{Memcmp, RpcFilterType},
-};
-use std::{env, sync::Arc};
-use tokio::time::{Duration, sleep};
-use twob_anchor::{
-    accounts::TradePosition,
-    client::{accounts, args},
-};
-use twob_keepers::{
-    ARRAY_LENGTH, AccountResolver, END_SLOT_INTERVAL, MAXIMUM_DURATION_SLOTS,
-    accounts::{decode_account_data, fetch_market},
-    market_address_from_env, twob_anchor,
-};
+mod discovery;
+mod schedule;
+mod settlement;
 
-/// Pauses freeze the position's end slot. Only abandoned pauses may be closed publicly.
-fn public_close_slot(position: &TradePosition) -> Option<u64> {
-    if position.paused_at_slot > 0 {
-        position
-            .start_slot
-            .checked_add(MAXIMUM_DURATION_SLOTS)?
-            .checked_add(1)
-    } else {
-        position
-            .last_update_slot
-            .checked_add(u64::from(position.remaining_slots))
+use anchor_client::solana_sdk::{commitment_config::CommitmentConfig, signature::Keypair};
+use anchor_lang::prelude::Pubkey;
+use anyhow::{Context, Result, ensure};
+use discovery::{DiscoveryEvent, decode_position};
+use schedule::Schedule;
+use settlement::{Disposition, Settlement, SettlementConfig};
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use std::{env, sync::Arc};
+use tokio::{
+    sync::mpsc,
+    time::{Duration, Instant, sleep_until},
+};
+use twob_keepers::market_address_from_env;
+
+const CANDIDATES_PER_PASS: usize = 32;
+
+struct Config {
+    batch_window: Duration,
+    reconcile_interval: Duration,
+    missing_receiver_retry: Duration,
+    retry_delay: Duration,
+    slot_duration: Duration,
+    settlement: SettlementConfig,
+}
+
+impl Config {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            batch_window: duration_env("TRADE_KEEPER_BATCH_WINDOW_MS", 5_000)?,
+            reconcile_interval: duration_env("TRADE_KEEPER_RECONCILE_INTERVAL_MS", 300_000)?,
+            missing_receiver_retry: duration_env(
+                "TRADE_KEEPER_MISSING_RECEIVER_RETRY_MS",
+                300_000,
+            )?,
+            retry_delay: duration_env("TRADE_KEEPER_RETRY_DELAY_MS", 15_000)?,
+            slot_duration: Duration::from_millis(number_env(
+                "TRADE_KEEPER_ESTIMATED_SLOT_DURATION_MS",
+                400,
+                10_000,
+            )?),
+            settlement: SettlementConfig {
+                max_batch_size: number_env("TRADE_KEEPER_MAX_BATCH_SIZE", 4, 16)? as usize,
+                compute_unit_limit: number_env(
+                    "TRADE_KEEPER_COMPUTE_UNIT_LIMIT",
+                    100_000,
+                    1_400_000,
+                )? as u32,
+            },
+        })
+    }
+}
+
+fn duration_env(key: &str, default: u64) -> Result<Duration> {
+    Ok(Duration::from_millis(number_env(key, default, 86_400_000)?))
+}
+
+fn number_env(key: &str, default: u64, max: u64) -> Result<u64> {
+    let value = env::var(key).ok().filter(|value| !value.trim().is_empty());
+    parse_number(key, value.as_deref(), default, max)
+}
+
+fn parse_number(key: &str, value: Option<&str>, default: u64, max: u64) -> Result<u64> {
+    let value = value
+        .map(|value| value.trim().parse::<u64>())
+        .transpose()
+        .with_context(|| format!("{key} must be an unsigned integer"))?
+        .unwrap_or(default);
+    ensure!(
+        value > 0 && value <= max,
+        "{key} must be between 1 and {max}"
+    );
+    Ok(value)
+}
+
+fn handle_notification(
+    notification: Option<DiscoveryEvent>,
+    market: &Pubkey,
+    schedule: &mut Schedule,
+    next_scan: &mut Instant,
+    scan_retry_not_before: Instant,
+    subscription_open: &mut bool,
+) {
+    match notification {
+        Some(DiscoveryEvent::Connected) => {
+            *next_scan = Instant::now().max(scan_retry_not_before);
+        }
+        Some(DiscoveryEvent::Account {
+            slot,
+            address,
+            account,
+        }) => match decode_position(&account, market) {
+            Ok(position) => schedule.notification(address, position, slot, Instant::now()),
+            Err(error) => eprintln!("Ignoring invalid position update {address}: {error:#}"),
+        },
+        None => {
+            *subscription_open = false;
+            eprintln!("Trade subscription task stopped; continuing periodic HTTP discovery");
+        }
     }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     dotenv::dotenv().ok();
+    let config = Config::from_env()?;
     let payer_bytes: Vec<u8> = serde_json::from_str(&env::var("PAYER_KEYPAIR")?)
         .context("PAYER_KEYPAIR must be a JSON array of keypair bytes")?;
     let payer = Arc::new(
         Keypair::try_from(payer_bytes.as_slice())
             .context("PAYER_KEYPAIR must be a valid keypair")?,
     );
-    let market_address = market_address_from_env("MARKET_ADDRESS")?;
-    let cluster = Cluster::Custom(env::var("CLUSTER_RPC_URL")?, env::var("CLUSTER_WS_URL")?);
-    let client = Client::new_with_options(cluster, payer.clone(), CommitmentConfig::confirmed());
-    let program = client.program(twob_anchor::ID)?;
-    let rpc = program.rpc();
-    let resolver = AccountResolver::new(twob_anchor::ID);
-    let market = fetch_market(&rpc, &market_address).await?;
-    let base_token_program = rpc.get_account(&market.base_mint).await?.owner;
-    let quote_token_program = rpc.get_account(&market.quote_mint).await?.owner;
-    for owner in [base_token_program, quote_token_program] {
-        ensure!(
-            owner == spl_token::ID || owner == anchor_spl::token_2022::ID,
-            "market mint is not owned by a supported token program"
-        );
-    }
-    let base_vault = resolver.associated_token_account_with_program(
-        &market_address,
-        &market.base_mint,
-        &base_token_program,
-    );
-    let quote_vault = resolver.associated_token_account_with_program(
-        &market_address,
-        &market.quote_mint,
-        &quote_token_program,
+    let market = market_address_from_env("MARKET_ADDRESS")?;
+    let rpc = Arc::new(RpcClient::new_with_timeout_and_commitment(
+        env::var("CLUSTER_RPC_URL")?,
+        Duration::from_secs(30),
+        CommitmentConfig::confirmed(),
+    ));
+    let settlement = Settlement::new(rpc.clone(), payer, market, config.settlement).await?;
+    let mut schedule = Schedule::new(config.slot_duration, config.batch_window);
+    let (sender, mut notifications) = mpsc::channel(1024);
+    let subscription = tokio::spawn(discovery::subscribe(
+        env::var("CLUSTER_WS_URL")?,
+        market,
+        sender,
+    ));
+    // A successful subscription triggers an immediate snapshot; a failed/unsupported
+    // subscription still gets HTTP discovery after the bounded startup wait.
+    let mut next_scan = Instant::now() + Duration::from_secs(5);
+    let mut scan_retry_not_before = Instant::now();
+    let mut scan_backoff = config.retry_delay;
+    let mut subscription_open = true;
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    println!(
+        "Trade keeper started market={market} batch_window_ms={} reconcile_interval_ms={} missing_receiver_retry_ms={}",
+        config.batch_window.as_millis(),
+        config.reconcile_interval.as_millis(),
+        config.missing_receiver_retry.as_millis(),
     );
 
-    loop {
-        // Market follows the authority in the zero-copy TradePosition header.
-        let positions = rpc
-            .get_program_accounts_with_config(
-                &program.id(),
-                RpcProgramAccountsConfig {
-                    filters: Some(vec![
-                        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                            0,
-                            TradePosition::DISCRIMINATOR.to_vec(),
-                        )),
-                        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                            40,
-                            market_address.to_bytes().to_vec(),
-                        )),
-                    ]),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        for (position_address, account) in positions {
-            let position: TradePosition = decode_account_data(&account.data)?;
-            if position.market != market_address {
-                continue;
+    'keeper: loop {
+        let wake = schedule
+            .next_check()
+            .map_or(next_scan, |due| due.min(next_scan));
+        tokio::select! {
+            _ = &mut shutdown => break,
+            notification = notifications.recv(), if subscription_open => {
+                handle_notification(notification, &market, &mut schedule, &mut next_scan,
+                    scan_retry_not_before, &mut subscription_open);
             }
-            let current_slot = rpc.get_slot().await?;
-            let Some(close_slot) = public_close_slot(&position) else {
-                continue;
-            };
-            if current_slot < close_slot {
-                continue;
-            }
-            let reference_index = current_slot / END_SLOT_INTERVAL / ARRAY_LENGTH;
-            let Some(previous_index) = reference_index.checked_sub(1) else {
-                continue;
-            };
-            let end_slot = position
-                .last_update_slot
-                .checked_add(u64::from(position.remaining_slots))
-                .context("position end slot overflow")?;
-            let end_index = end_slot / END_SLOT_INTERVAL / ARRAY_LENGTH;
-            let receiver_base_token_account = resolver.receiver_token_account(
-                &position_address,
-                &position.base_receiver,
-                &market.base_mint,
-                &base_token_program,
-            );
-            let receiver_quote_token_account = resolver.receiver_token_account(
-                &position_address,
-                &position.quote_receiver,
-                &market.quote_mint,
-                &quote_token_program,
-            );
-
-            // Public settlement requires existing non-native ATAs. Native payouts use a temporary PDA.
-            let mut receivers_ready = true;
-            for (mint, receiver) in [
-                (market.base_mint, receiver_base_token_account),
-                (market.quote_mint, receiver_quote_token_account),
-            ] {
-                if mint != spl_token::native_mint::ID && rpc.get_account(&receiver).await.is_err() {
-                    receivers_ready = false;
+            _ = sleep_until(wake) => {
+                if Instant::now() >= next_scan {
+                    match discovery::snapshot(&rpc, &market, schedule.snapshot_slot()).await {
+                        Ok((slot, accounts)) => {
+                            let mut positions = Vec::with_capacity(accounts.len());
+                            for (address, account) in accounts {
+                                match decode_position(&account, &market) {
+                                    Ok(Some(position)) => positions.push((address, position)),
+                                    Ok(None) => {},
+                                    Err(error) => eprintln!("Ignoring invalid position {address}: {error:#}"),
+                                }
+                            }
+                            schedule.reconcile(positions, slot, Instant::now());
+                            println!("Reconciled trade positions slot={slot} tracked={}", schedule.len());
+                            next_scan = Instant::now() + config.reconcile_interval;
+                            scan_retry_not_before = Instant::now();
+                            scan_backoff = config.retry_delay;
+                        }
+                        Err(error) => {
+                            eprintln!("Trade discovery failed; retrying in {}s: {error:#}", scan_backoff.as_secs());
+                            next_scan = Instant::now() + scan_backoff;
+                            scan_retry_not_before = next_scan;
+                            scan_backoff = (scan_backoff * 2).min(config.reconcile_interval.max(config.retry_delay));
+                        }
+                    }
                 }
-            }
-            if !receivers_ready {
-                continue;
-            }
-
-            let result = program
-                .request()
-                .accounts(accounts::PublicCloseTradePosition {
-                    signer: payer.pubkey(),
-                    program_config: resolver.program_config_pda().address(),
-                    payer: position.payer,
-                    base_receiver: position.base_receiver,
-                    quote_receiver: position.quote_receiver,
-                    base_mint: market.base_mint,
-                    quote_mint: market.quote_mint,
-                    receiver_base_token_account,
-                    receiver_quote_token_account,
-                    market: market_address,
-                    trade_position: position_address,
-                    base_vault,
-                    quote_vault,
-                    future_interval: resolver
-                        .market_interval_pda(&market_address, end_index)
-                        .address(),
-                    current_interval: resolver
-                        .market_interval_pda(&market_address, reference_index)
-                        .address(),
-                    previous_interval: resolver
-                        .market_interval_pda(&market_address, previous_index)
-                        .address(),
-                    base_token_program,
-                    quote_token_program,
-                    associated_token_program: spl_associated_token_account::ID,
-                    system_program: system_program::ID,
-                })
-                .args(args::PublicCloseTradePosition { reference_index })
-                .send()
-                .await;
-            match result {
-                Ok(signature) => println!("Closed trade position {position_address}: {signature}"),
-                Err(error) => {
-                    eprintln!("Failed to close trade position {position_address}: {error}")
+                let candidates = schedule.due(Instant::now(), CANDIDATES_PER_PASS);
+                if candidates.is_empty() {
+                    continue;
+                }
+                // One in-flight pass avoids competing writes to the shared market and vaults.
+                // Keep consuming mutations and shutdown while RPC/confirmation is in flight.
+                // Version guards prevent the older settlement read from undoing newer updates.
+                let processing = settlement.process(&candidates);
+                tokio::pin!(processing);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut processing => break result,
+                        _ = &mut shutdown => break 'keeper,
+                        notification = notifications.recv(), if subscription_open => {
+                            handle_notification(notification, &market, &mut schedule, &mut next_scan,
+                                scan_retry_not_before, &mut subscription_open);
+                        }
+                    }
+                };
+                match result {
+                    Ok(outcomes) => {
+                        for outcome in outcomes {
+                            let now = Instant::now();
+                            match outcome.disposition {
+                                Disposition::Closed => schedule.outcome(outcome.address, None, outcome.slot, now, None),
+                                Disposition::NotDue => schedule.outcome(outcome.address, outcome.position, outcome.slot, now, None),
+                                Disposition::MissingReceiver => {
+                                    println!("Deferring position {}: receiving token account missing or invalid", outcome.address);
+                                    schedule.outcome(outcome.address, outcome.position, outcome.slot, now, Some(config.missing_receiver_retry));
+                                }
+                                Disposition::Retry => {
+                                    if outcome.position.is_some() {
+                                        schedule.outcome(outcome.address, outcome.position, outcome.slot, now, Some(config.retry_delay));
+                                    } else {
+                                        schedule.retry(outcome.address, now, config.retry_delay);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Trade settlement pass failed: {error:#}");
+                        for &address in &candidates {
+                            schedule.retry(address, Instant::now(), config.retry_delay);
+                        }
+                    }
                 }
             }
         }
-        sleep(Duration::from_secs(5)).await;
     }
+    subscription.abort();
+    println!("Trade keeper stopped");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -187,21 +238,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_closure_uses_resumed_end_slot_and_abandonment_for_pauses() {
-        let mut position = TradePosition {
-            start_slot: 100,
-            last_update_slot: 200,
-            remaining_slots: 33,
-            ..Default::default()
-        };
-        assert_eq!(public_close_slot(&position), Some(233));
-        position.paused_at_slot = 211;
-        assert_eq!(
-            public_close_slot(&position),
-            Some(100 + MAXIMUM_DURATION_SLOTS + 1)
-        );
-        position.paused_at_slot = 0;
-        position.last_update_slot = u64::MAX;
-        assert_eq!(public_close_slot(&position), None);
+    fn tuning_rejects_zero_overflow_and_unbounded_values() {
+        assert_eq!(parse_number("TEST", None, 4, 16).unwrap(), 4);
+        assert_eq!(parse_number("TEST", Some(" 16 "), 4, 16).unwrap(), 16);
+        for invalid in ["0", "17", "-1", "18446744073709551616", "abc"] {
+            assert!(parse_number("TEST", Some(invalid), 4, 16).is_err());
+        }
     }
 }
