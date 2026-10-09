@@ -56,3 +56,46 @@ prometheus.remote_write "grafana_cloud" {
 		}
 	}
 }
+
+// Add these scrape components to the existing bookkeeper-alloy config.
+// Reuses prometheus.remote_write.grafana_cloud and environment="mainnet".
+// Set target variables in Railway using the service reference variables:
+// MARKET_MAKER_METRICS_ADDRESS=${{cca-market-maker.RAILWAY_PRIVATE_DOMAIN}}:8080
+// MAKER_MONITOR_METRICS_ADDRESS=${{maker-monitor.RAILWAY_PRIVATE_DOMAIN}}:8080
+// Both exporters must listen on [::]:8080 in the same project/environment.
+
+prometheus.scrape "market_maker" {
+  targets = [{
+    "__address__" = sys.env("MARKET_MAKER_METRICS_ADDRESS"),
+    "instance" = "mainnet-market-maker",
+    "service" = "market-maker",
+    "market_address" = "FUDH6hiwDNjdQKbH7fveFFPoEE3mXk9i1g2WbgnSqob3",
+  }]
+
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "market-maker"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "maker_monitor" {
+  targets = [{
+    "__address__" = sys.env("MAKER_MONITOR_METRICS_ADDRESS"),
+    "instance" = "mainnet-market-maker-chain",
+    "service" = "market-maker",
+    "market_address" = "FUDH6hiwDNjdQKbH7fveFFPoEE3mXk9i1g2WbgnSqob3",
+  }]
+
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "maker-monitor"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
