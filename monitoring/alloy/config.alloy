@@ -99,3 +99,46 @@ prometheus.scrape "maker_monitor" {
 
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
+
+// Append to existing collector; retains dedicated scrape jobs and receiver.
+prometheus.scrape "permissionless_maker" {
+  targets = [{
+    "__address__" = sys.env("PERMISSIONLESS_MAKER_METRICS_ADDRESS"),
+    "instance" = "permissionless-GxyExYjbyEKm8ezdzYVgMtYA3gms76KghxRyd4tzTnT5",
+    "service" = "market-maker",
+    "market_address" = "FUDH6hiwDNjdQKbH7fveFFPoEE3mXk9i1g2WbgnSqob3",
+    "position_address" = "GxyExYjbyEKm8ezdzYVgMtYA3gms76KghxRyd4tzTnT5",
+    "program_id" = "TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A",
+    "maker_kind" = "permissionless",
+  }]
+
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "permissionless-maker"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "permissionless_monitor" {
+  targets = [{
+    "__address__" = sys.env("PERMISSIONLESS_MONITOR_METRICS_ADDRESS"),
+    "instance" = "permissionless-chain-GxyExYjbyEKm8ezdzYVgMtYA3gms76KghxRyd4tzTnT5",
+    "service" = "market-maker",
+    "market_address" = "FUDH6hiwDNjdQKbH7fveFFPoEE3mXk9i1g2WbgnSqob3",
+    "position_address" = "GxyExYjbyEKm8ezdzYVgMtYA3gms76KghxRyd4tzTnT5",
+    "program_id" = "TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A",
+    "maker_kind" = "permissionless",
+  }]
+
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "permissionless-monitor"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
