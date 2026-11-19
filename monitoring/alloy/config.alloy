@@ -142,3 +142,129 @@ prometheus.scrape "permissionless_monitor" {
 
   forward_to = [prometheus.remote_write.grafana_cloud.receiver]
 }
+
+// ANT/USDC: additive targets; retain all existing SOL components.
+prometheus.scrape "ant_bookkeepers" {
+  targets = [
+    {
+      "__address__" = "ant-bookkeeper.railway.internal:8080",
+      "instance" = "mainnet-ant-usdc-40",
+      "service" = "bookkeeper",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+    },
+    {
+      "__address__" = "ant-bookkeeper-backup.railway.internal:8080",
+      "instance" = "mainnet-ant-usdc-45",
+      "service" = "bookkeeper",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+    },
+  ]
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "bookkeeper"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "ant_bookkeeper_canary" {
+  targets = [
+    {
+      "__address__" = "ant-bookkeeper-canary.railway.internal:8080",
+      "instance" = "mainnet-ant-usdc-chain",
+      "service" = "bookkeeper",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+    },
+  ]
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "bookkeeper-canary"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "ant_permissionless_maker" {
+  targets = [
+    {
+      "__address__" = "ant-maker.railway.internal:8080",
+      "instance" = "ant-permissionless-maker",
+      "service" = "market-maker",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+      "position_address" = "HtfJYkhttTPi7tXQvd87zuphrxfPTqBGsvBwjnKQ8jeE",
+      "program_id" = "TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A",
+      "maker_kind" = "permissionless",
+    },
+  ]
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "permissionless-maker"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "ant_permissionless_monitor" {
+  targets = [
+    {
+      "__address__" = "ant-maker-monitor.railway.internal:8080",
+      "instance" = "ant-permissionless-chain",
+      "service" = "market-maker",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+      "position_address" = "HtfJYkhttTPi7tXQvd87zuphrxfPTqBGsvBwjnKQ8jeE",
+      "program_id" = "TwobwMYkKbT8uMWqgPrEPXTPoyYsKAPmaWun6T2WT4A",
+      "maker_kind" = "permissionless",
+    },
+  ]
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "permissionless-monitor"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.scrape "ant_oracle" {
+  targets = [
+    {
+      "__address__" = "ant-oracle.railway.internal:8080",
+      "instance" = "ant-oracle",
+      "service" = "market-maker",
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+    },
+  ]
+  scheme = "http"
+  metrics_path = "/metrics"
+  job_name = "ant-oracle"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  honor_labels = true
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+// /health is 503 when the source observation expires, even if cached fetches succeed.
+prometheus.exporter.blackbox "ant_oracle" {
+  config = "{ modules: { http_2xx: { prober: http, timeout: 4s } } }"
+  target {
+    name = "ant-oracle-health"
+    address = "http://ant-oracle.railway.internal:8080/health"
+    module = "http_2xx"
+    labels = {
+      "market_address" = "H16ZeZee8yGw94kGVx4aEHmC8PwWjwuLuqsW2g8MK2Pz",
+      "service" = "market-maker",
+      "pair" = "ANT/USDC",
+    }
+  }
+}
+
+prometheus.scrape "ant_oracle_health" {
+  targets = prometheus.exporter.blackbox.ant_oracle.targets
+  job_name = "ant-oracle-health"
+  scrape_interval = "10s"
+  scrape_timeout = "5s"
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
